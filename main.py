@@ -468,14 +468,16 @@ async def is_member_async(bot, channel: str, user_id: int) -> Optional[bool]:
         err = str(e).lower()
         log.error(f"Membership check error for {chat_id}: {e}")
         
-        if "user not found" in err or "chat not found" in err:
+        # FIXED: Handle common error cases
+        if "user not found" in err or "chat not found" in err or "400" in err:
             db.cache_membership(user_id, channel, False)
             return False
-        elif "forbidden" in err or "bot was kicked" in err:
+        elif "forbidden" in err or "bot was kicked" in err or "bot is not a member" in err:
             # Bot doesn't have permission to check membership
             log.warning(f"Bot cannot check membership in {channel}: {e}")
+            # Don't cache in this case as we don't know the actual status
             return None
-        elif "user is deactivated" in err:
+        elif "user is deactivated" in err or "user not participant" in err:
             # User account is deleted/banned
             db.cache_membership(user_id, channel, False)
             return False
@@ -680,24 +682,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ File not found or expired")
             return
 
-        # Membership check
+        # Membership check - FIXED: await properly
         result = await check_membership_async(context.bot, user_id)
 
         if not result["all_joined"]:
-            keyboard = [
-                [InlineKeyboardButton("📢 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
-                [InlineKeyboardButton("📢 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")],
-                [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
-            ]
+            # Build detailed message showing which channels are missing
+            text = "🔒 Access Locked\n\n"
+            if not result['channel1']:
+                text += f"❌ Not joined: @{CHANNEL_1}\n"
+            if not result['channel2']:
+                text += f"❌ Not joined: @{CHANNEL_2}\n"
+            text += "\nPlease join both channels to unlock this file 👇"
+            
+            keyboard = []
+            if not result['channel1']:
+                keyboard.append([InlineKeyboardButton(f"Join @{CHANNEL_1}", url=f"https://t.me/{CHANNEL_1}")])
+            if not result['channel2']:
+                keyboard.append([InlineKeyboardButton(f"Join @{CHANNEL_2}", url=f"https://t.me/{CHANNEL_2}")])
+            
+            keyboard.append([InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")])
+            
+            # Add timestamp to prevent "not modified" errors
+            text += f"\n\n🕐 Checked at: {datetime.now().strftime('%H:%M:%S')}"
 
             await update.message.reply_text(
-                "🔒 Access Locked\n\n"
-                "Please join both channels to unlock this file 👇",
+                text,
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
             return
 
-        # ✅ Send file
+        # ✅ Send file - user has joined both channels
         send_as_video, supports_streaming = should_send_as_video(file_info)
 
         if send_as_video and file_info["is_video"]:
@@ -724,8 +738,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         log.error(f"Start error: {e}")
+        log.error(traceback.format_exc())  # Add this for debugging
         if update.message:
             await update.message.reply_text("❌ Error processing request")
+    
 
 
 
@@ -737,7 +753,8 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         if not query:
             return
-        await query.answer()
+        
+        await query.answer("Checking membership...")
         
         user_id = query.from_user.id
         data_parts = query.data.split("|")
@@ -745,7 +762,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(data_parts) != 2:
             return
         
-        _, key = data_parts
+        action, key = data_parts
         
         # Check if file exists
         file_info = db.get_file(key)
@@ -756,55 +773,58 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Check membership (ASYNC)
         result = await check_membership_async(context.bot, user_id)
         
+        # FIXED: Use a temporary message to avoid "not modified" errors
         if not result['all_joined']:
-            # Build current status text
-            text = "❌ Still not joined:\n"
-            missing_channels = []
+            # Build detailed message
+            text = "❌ Still not joined:\n\n"
             
             if not result['channel1']:
-                text += f"\n• @{CHANNEL_1}"
-                missing_channels.append(("Join Channel 1", CHANNEL_1))
+                text += f"• ❌ @{CHANNEL_1}\n"
+            else:
+                text += f"• ✅ @{CHANNEL_1}\n"
+                
             if not result['channel2']:
-                text += f"\n• @{CHANNEL_2}"
-                missing_channels.append(("Join Channel 2", CHANNEL_2))
+                text += f"• ❌ @{CHANNEL_2}\n"
+            else:
+                text += f"• ✅ @{CHANNEL_2}\n"
             
+            # Show errors if any
             if result['errors']:
-                text += f"\n\n⚠️ {', '.join(result['errors'])}"
+                text += f"\n⚠️ Note: {', '.join(result['errors'])}"
+            
+            text += f"\n\n🔄 Click 'Check Again' after joining"
             
             # Build keyboard
             keyboard = []
-            for btn_text, channel in missing_channels:
-                keyboard.append([InlineKeyboardButton(btn_text, url=f"https://t.me/{channel.replace('@', '')}")])
+            if not result['channel1']:
+                keyboard.append([InlineKeyboardButton(f"Join @{CHANNEL_1}", url=f"https://t.me/{CHANNEL_1}")])
+            if not result['channel2']:
+                keyboard.append([InlineKeyboardButton(f"Join @{CHANNEL_2}", url=f"https://t.me/{CHANNEL_2}")])
             keyboard.append([InlineKeyboardButton("🔄 Check Again", callback_data=f"check|{key}")])
-            
-            # Add timestamp or random element to prevent "not modified" error
-            current_time = int(time.time())
-            text += f"\n\n⏰ Last checked: {current_time}"
             
             try:
                 await query.edit_message_text(
                     text,
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
-            except Exception as edit_error:
-                if "not modified" in str(edit_error).lower():
-                    # Silently ignore this error - message is already up-to-date
-                    pass
-                else:
-                    raise edit_error
+            except Exception as e:
+                if "message is not modified" not in str(e).lower():
+                    raise
             return
         
-        # ✅ User has joined both channels - send file
+        # ✅ User has joined both channels
         filename = file_info.get('file_name', 'file')
-        send_as_video, supports_streaming = should_send_as_video(file_info)
         
+        # Delete the "check again" message first
         try:
-            # Delete the "check again" message first
             await query.delete_message()
         except:
-            pass  # Ignore if message can't be deleted
+            pass
         
+        # Send the file
         try:
+            send_as_video, supports_streaming = should_send_as_video(file_info)
+            
             if send_as_video and file_info.get('is_video'):
                 sent_msg = await context.bot.send_video(
                     chat_id=query.message.chat_id,
@@ -818,34 +838,29 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     document=file_info["file_id"],
                     caption=f"📁 {filename}"
                 )
+            
+            # Schedule deletion
+            if sent_msg:
+                context.job_queue.run_once(
+                    delete_job,
+                    DELETE_AFTER,
+                    data={"chat": query.message.chat_id, "msg": sent_msg.message_id}
+                )
+                
         except Exception as e:
             log.error(f"Failed to send file: {e}")
-            # If we deleted the message, send a new one
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
-                text="❌ Failed to send file"
-            )
-            return
-        
-        # Schedule deletion
-        if sent_msg:
-            context.job_queue.run_once(
-                delete_job,
-                DELETE_AFTER,
-                data={"chat": query.message.chat_id, "msg": sent_msg.message_id}
+                text="❌ Failed to send file. Please try again."
             )
         
     except Exception as e:
-        if "not modified" in str(e).lower():
-            # Silently ignore "message not modified" errors
+        log.error(f"Callback error: {e}")
+        log.error(traceback.format_exc())
+        try:
+            await query.answer("Error occurred. Please try again.", show_alert=True)
+        except:
             pass
-        else:
-            log.error(f"Callback error: {e}")
-            if update.callback_query:
-                try:
-                    await update.callback_query.answer("Error occurred", show_alert=True)
-                except:
-                    pass
 
 # ============ UPLOAD HANDLER (ADMIN ONLY) ============
 async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
