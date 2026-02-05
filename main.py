@@ -438,29 +438,47 @@ def get_file_count():
     return db.get_file_count()
 
 # ============ MEMBERSHIP CHECK ============
+# ============ MEMBERSHIP CHECK ============
 async def is_member_async(bot, channel: str, user_id: int) -> Optional[bool]:
     """ASYNCHRONOUS membership check with caching"""
     # Check cache first
     cached = db.get_cached_membership(user_id, channel)
     if cached is not None:
+        log.info(f"Cached result for {user_id} in {channel}: {cached}")
         return cached
     
-    chat_id = f"@{channel}" if not channel.startswith("@") else channel
+    # Clean up channel name
+    channel = channel.strip()
+    if channel.startswith("https://t.me/"):
+        channel = channel.replace("https://t.me/", "")
+    if channel.startswith("@"):
+        channel = channel[1:]
+    
+    chat_id = f"@{channel}"
+    
+    log.info(f"Checking membership for {user_id} in {chat_id}")
     
     try:
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
         is_member = member.status in ("member", "administrator", "creator")
+        log.info(f"Membership result for {user_id} in {chat_id}: {is_member} (status: {member.status})")
         db.cache_membership(user_id, channel, is_member)
         return is_member
     except Exception as e:
         err = str(e).lower()
+        log.error(f"Membership check error for {chat_id}: {e}")
+        
         if "user not found" in err or "chat not found" in err:
             db.cache_membership(user_id, channel, False)
             return False
-        elif "forbidden" in err:
+        elif "forbidden" in err or "bot was kicked" in err:
             # Bot doesn't have permission to check membership
             log.warning(f"Bot cannot check membership in {channel}: {e}")
             return None
+        elif "user is deactivated" in err:
+            # User account is deleted/banned
+            db.cache_membership(user_id, channel, False)
+            return False
         else:
             log.warning(f"Membership check failed for {channel}: {e}")
             return None
@@ -478,18 +496,20 @@ async def check_membership_async(bot, user_id: int) -> Dict[str, Any]:
         # Check first channel
         ch1 = await is_member_async(bot, CHANNEL_1, user_id)
         if ch1 is None:
-            result['errors'].append(f"Cannot check @{CHANNEL_1}")
+            result['errors'].append(f"Cannot check @{CHANNEL_1} (bot may not have permission)")
             ch1 = False
         
         # Check second channel
         ch2 = await is_member_async(bot, CHANNEL_2, user_id)
         if ch2 is None:
-            result['errors'].append(f"Cannot check @{CHANNEL_2}")
+            result['errors'].append(f"Cannot check @{CHANNEL_2} (bot may not have permission)")
             ch2 = False
         
         result['channel1'] = ch1
         result['channel2'] = ch2
         result['all_joined'] = ch1 and ch2
+        
+        log.info(f"Final membership check for {user_id}: ch1={ch1}, ch2={ch2}, all_joined={result['all_joined']}")
         
     except Exception as e:
         log.error(f"Membership check error: {e}")
@@ -710,6 +730,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============ CALLBACK ============
+# ============ CALLBACK ============
 async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle check membership callback"""
     try:
@@ -736,32 +757,52 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await check_membership_async(context.bot, user_id)
         
         if not result['all_joined']:
-            # Update the message with current status
+            # Build current status text
             text = "❌ Still not joined:\n"
+            missing_channels = []
+            
             if not result['channel1']:
                 text += f"\n• @{CHANNEL_1}"
+                missing_channels.append(("Join Channel 1", CHANNEL_1))
             if not result['channel2']:
                 text += f"\n• @{CHANNEL_2}"
+                missing_channels.append(("Join Channel 2", CHANNEL_2))
             
             if result['errors']:
                 text += f"\n\n⚠️ {', '.join(result['errors'])}"
             
+            # Build keyboard
             keyboard = []
-            if not result['channel1']:
-                keyboard.append([InlineKeyboardButton("Join Channel 1", url=f"https://t.me/{CHANNEL_1.replace('@', '')}")])
-            if not result['channel2']:
-                keyboard.append([InlineKeyboardButton("Join Channel 2", url=f"https://t.me/{CHANNEL_2.replace('@', '')}")])
+            for btn_text, channel in missing_channels:
+                keyboard.append([InlineKeyboardButton(btn_text, url=f"https://t.me/{channel.replace('@', '')}")])
             keyboard.append([InlineKeyboardButton("🔄 Check Again", callback_data=f"check|{key}")])
             
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
+            # Add timestamp or random element to prevent "not modified" error
+            current_time = int(time.time())
+            text += f"\n\n⏰ Last checked: {current_time}"
+            
+            try:
+                await query.edit_message_text(
+                    text,
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            except Exception as edit_error:
+                if "not modified" in str(edit_error).lower():
+                    # Silently ignore this error - message is already up-to-date
+                    pass
+                else:
+                    raise edit_error
             return
         
-        # Send file
+        # ✅ User has joined both channels - send file
         filename = file_info.get('file_name', 'file')
         send_as_video, supports_streaming = should_send_as_video(file_info)
+        
+        try:
+            # Delete the "check again" message first
+            await query.delete_message()
+        except:
+            pass  # Ignore if message can't be deleted
         
         try:
             if send_as_video and file_info.get('is_video'):
@@ -779,10 +820,12 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         except Exception as e:
             log.error(f"Failed to send file: {e}")
-            await query.edit_message_text("❌ Failed to send file")
+            # If we deleted the message, send a new one
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="❌ Failed to send file"
+            )
             return
-        
-        await query.edit_message_text("✅ Access granted! File sent.")
         
         # Schedule deletion
         if sent_msg:
@@ -793,9 +836,16 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         
     except Exception as e:
-        log.error(f"Callback error: {e}")
-        if update.callback_query:
-            await update.callback_query.answer("Error occurred", show_alert=True)
+        if "not modified" in str(e).lower():
+            # Silently ignore "message not modified" errors
+            pass
+        else:
+            log.error(f"Callback error: {e}")
+            if update.callback_query:
+                try:
+                    await update.callback_query.answer("Error occurred", show_alert=True)
+                except:
+                    pass
 
 # ============ UPLOAD HANDLER (ADMIN ONLY) ============
 async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
