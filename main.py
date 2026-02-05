@@ -713,61 +713,57 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # User has joined both channels - send the file
-        try:
-            filename = file_info['file_name']
-            ext = filename.lower().split('.')[-1] if '.' in filename else ""
-            
-            if file_info['is_video'] and ext in PLAYABLE_EXTS:
-                # Send as playable video
-                sent = await context.bot.send_video(
-                    chat_id=chat_id,
-                    video=file_info["file_id"],
-                    caption=f"🎬 *{filename}*",
-                    parse_mode="Markdown",
-                    supports_streaming=True
-                )
-            else:
-                # Send as document
-                sent = await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=file_info["file_id"],
-                    caption=f"📁 *{filename}*",
-                    parse_mode="Markdown"
-                )
-            
-            # Schedule deletion
-            if sent:
-                context.job_queue.run_once(
-                    delete_job,
-                    DELETE_AFTER,
-                    data={"chat": chat_id, "msg": sent.message_id}
-                )
-                
-        except Exception as e:
-            log.error(f"Error sending file: {e}", exc_info=True)
-            # Try alternative method if first fails
-            try:
-                sent = await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=file_info["file_id"],
-                    caption=f"📁 *{filename}* (sent as document)",
-                    parse_mode="Markdown"
-                )
-                
-                if sent:
-                    context.job_queue.run_once(
-                        delete_job,
-                        DELETE_AFTER,
-                        data={"chat": chat_id, "msg": sent.message_id}
-                    )
-            except Exception as e2:
-                log.error(f"Alternative send also failed: {e2}")
-                await update.message.reply_text("❌ Failed to send file. Please try again later.")
+       filename = file_info['file_name']
+ext = filename.lower().split('.')[-1] if '.' in filename else ""
+sent = None
 
-    except Exception as e:
-        log.error(f"Start error: {e}", exc_info=True)
+from html import escape
+safe_name = escape(filename)
+
+try:
+    if file_info['is_video'] and ext in PLAYABLE_EXTS:
+        sent = await context.bot.send_video(
+            chat_id=chat_id,
+            video=file_info["file_id"],
+            caption=f"🎬 <b>{safe_name}</b>",
+            parse_mode="HTML",
+            supports_streaming=True
+        )
+    else:
+        sent = await context.bot.send_document(
+            chat_id=chat_id,
+            document=file_info["file_id"],
+            caption=f"📁 <b>{safe_name}</b>",
+            parse_mode="HTML"
+        )
+except Exception as e:
+    log.warning(f"Primary send method failed for {filename}: {e}")
+    try:
+        sent = await context.bot.send_document(
+            chat_id=chat_id,
+            document=file_info["file_id"],
+            caption=f"📁 <b>{safe_name}</b>",
+            parse_mode="HTML"
+        )
+    except Exception as e2:
+        log.error(f"Failed to send file {filename}: {e2}", exc_info=True)
         if update.message:
-            await update.message.reply_text("❌ Error processing request")
+            await update.message.reply_text("❌ Failed to send file. Please try again later.")
+        elif update.callback_query:
+            await update.callback_query.edit_message_text(
+                "❌ Failed to send file. Please try again later."
+            )
+        return
+
+if sent:
+    context.job_queue.run_once(
+        delete_job,
+        DELETE_AFTER,
+        data={"chat": chat_id, "msg": sent.message_id}
+    )
+
+
+   
 
 async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle check membership callback"""
