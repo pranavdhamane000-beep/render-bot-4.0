@@ -713,57 +713,60 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # User has joined both channels - send the file
-       filename = file_info['file_name']
-ext = filename.lower().split('.')[-1] if '.' in filename else ""
-sent = None
+        try:
+            filename = file_info['file_name']
+            ext = filename.lower().split('.')[-1] if '.' in filename else ""
+            
+            if file_info['is_video'] and ext in PLAYABLE_EXTS:
+                # Send as playable video
+                sent = await context.bot.send_video(
+                    chat_id=chat_id,
+                    video=file_info["file_id"],
+                    caption=f"🎬 *{filename}*",
+                    parse_mode="Markdown",
+                    supports_streaming=True
+                )
+            else:
+                # Send as document
+                sent = await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=file_info["file_id"],
+                    caption=f"📁 *{filename}*",
+                    parse_mode="Markdown"
+                )
+            
+            # Schedule deletion with safety check - FIXED HERE
+            if sent and hasattr(context, 'job_queue') and context.job_queue:
+                context.job_queue.run_once(
+                    delete_job,
+                    DELETE_AFTER,
+                    data={"chat": chat_id, "msg": sent.message_id}
+                )
+            elif sent:
+                log.warning(f"Job queue not available for message {sent.message_id}")
+                
+        except Exception as e:
+            log.error(f"Error sending file: {e}", exc_info=True)
+            
+            # More specific error messages - FIXED HERE
+            error_msg = str(e).lower()
+            
+            if "file is too big" in error_msg or "too large" in error_msg:
+                await update.message.reply_text("❌ File is too large. Maximum size is 50MB for videos.")
+            elif "file not found" in error_msg or "invalid file id" in error_msg:
+                await update.message.reply_text("❌ File expired. Please contact admin.")
+            elif "forbidden" in error_msg:
+                await update.message.reply_text("❌ Bot can't send messages here.")
+            else:
+                await update.message.reply_text("❌ Failed to send file. Please try again.")
+            
+            # Log detailed error
+            log.error(f"File send failed for {key}: {traceback.format_exc()}")
 
-from html import escape
-safe_name = escape(filename)
-
-try:
-    if file_info['is_video'] and ext in PLAYABLE_EXTS:
-        sent = await context.bot.send_video(
-            chat_id=chat_id,
-            video=file_info["file_id"],
-            caption=f"🎬 <b>{safe_name}</b>",
-            parse_mode="HTML",
-            supports_streaming=True
-        )
-    else:
-        sent = await context.bot.send_document(
-            chat_id=chat_id,
-            document=file_info["file_id"],
-            caption=f"📁 <b>{safe_name}</b>",
-            parse_mode="HTML"
-        )
-except Exception as e:
-    log.warning(f"Primary send method failed for {filename}: {e}")
-    try:
-        sent = await context.bot.send_document(
-            chat_id=chat_id,
-            document=file_info["file_id"],
-            caption=f"📁 <b>{safe_name}</b>",
-            parse_mode="HTML"
-        )
-    except Exception as e2:
-        log.error(f"Failed to send file {filename}: {e2}", exc_info=True)
+    except Exception as e:
+        log.error(f"Start error: {e}", exc_info=True)
         if update.message:
-            await update.message.reply_text("❌ Failed to send file. Please try again later.")
-        elif update.callback_query:
-            await update.callback_query.edit_message_text(
-                "❌ Failed to send file. Please try again later."
-            )
-        return
-
-if sent:
-    context.job_queue.run_once(
-        delete_job,
-        DELETE_AFTER,
-        data={"chat": chat_id, "msg": sent.message_id}
-    )
-
-
-   
+            await update.message.reply_text("❌ Error processing request")
 
 async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle check membership callback"""
@@ -887,35 +890,28 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 await query.edit_message_text("✅ *Access granted! File sent below.*", parse_mode="Markdown")
                 
-                # Schedule deletion
-                if sent_msg:
+                # Schedule deletion with safety check - FIXED HERE
+                if sent_msg and hasattr(context, 'job_queue') and context.job_queue:
                     context.job_queue.run_once(
                         delete_job,
                         DELETE_AFTER,
                         data={"chat": query.message.chat_id, "msg": sent_msg.message_id}
                     )
+                elif sent_msg:
+                    log.warning(f"Job queue not available for callback message {sent_msg.message_id}")
                 
             except Exception as e:
-                log.error(f"Failed to send file in callback: {e}")
-                # Try alternative method
-                try:
-                    sent_msg = await context.bot.send_document(
-                        chat_id=query.message.chat_id,
-                        document=file_info["file_id"],
-                        caption=f"📁 *{filename}* (sent as document)",
-                        parse_mode="Markdown"
-                    )
-                    
-                    await query.edit_message_text("✅ *Access granted! File sent below.*", parse_mode="Markdown")
-                    
-                    if sent_msg:
-                        context.job_queue.run_once(
-                            delete_job,
-                            DELETE_AFTER,
-                            data={"chat": query.message.chat_id, "msg": sent_msg.message_id}
-                        )
-                except Exception as e2:
-                    log.error(f"Alternative send also failed in callback: {e2}")
+                log.error(f"Failed to send file in callback: {e}", exc_info=True)
+                # More specific error messages
+                error_msg = str(e).lower()
+                
+                if "file is too big" in error_msg or "too large" in error_msg:
+                    await query.edit_message_text("❌ File is too large (max 50MB).")
+                elif "file not found" in error_msg or "invalid file id" in error_msg:
+                    await query.edit_message_text("❌ File expired or invalid.")
+                elif "forbidden" in error_msg:
+                    await query.edit_message_text("❌ Bot can't send files here.")
+                else:
                     await query.edit_message_text("❌ Failed to send file. Please try again.")
         
     except Exception as e:
@@ -994,7 +990,14 @@ def start_bot():
         print("❌ ERROR: ADMIN_ID is not set or invalid!")
         return
     
+    # Initialize application with job queue
     application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Check if job queue is available
+    if application.job_queue:
+        print("🟢 Job queue initialized")
+    else:
+        print("⚠️ Job queue not available - auto-delete feature may not work")
 
     # Add handlers
     application.add_error_handler(error_handler)
