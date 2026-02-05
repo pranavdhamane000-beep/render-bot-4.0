@@ -246,17 +246,18 @@ class Database:
 # Initialize database
 db = Database()
 
-# ============ SIMPLIFIED MEMBERSHIP CHECK ============
-async def check_user_in_channel(bot, channel: str, user_id: int) -> bool:
+# ============ FIXED MEMBERSHIP CHECK ============
+async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bool = False) -> bool:
     """
-    Simplified check if user is in channel
+    Check if user is in channel
     Returns True if user is member, False if not or can't check
     """
-    # Check cache first
-    cached = db.get_cached_membership(user_id, channel)
-    if cached is not None:
-        log.info(f"Cache hit for user {user_id} in @{channel}: {cached}")
-        return cached
+    # Check cache first (unless force_check is True)
+    if not force_check:
+        cached = db.get_cached_membership(user_id, channel)
+        if cached is not None:
+            log.info(f"Cache hit for user {user_id} in @{channel}: {cached}")
+            return cached
     
     try:
         # Format channel username properly
@@ -287,23 +288,25 @@ async def check_user_in_channel(bot, channel: str, user_id: int) -> bool:
         error_msg = str(e).lower()
         log.warning(f"Failed to check user {user_id} in @{channel}: {e}")
         
-        # Cache failures as False (safer approach)
-        db.cache_membership(user_id, channel.replace("@", ""), False)
+        # Don't cache failures - let it check fresh next time
+        # Return True to avoid blocking users if there's a temporary issue
+        # But log the error
         
-        # Specific error handling
         if "user not found" in error_msg or "user not participant" in error_msg:
+            db.cache_membership(user_id, channel.replace("@", ""), False)
             return False
         elif "chat not found" in error_msg:
             log.error(f"Channel @{channel} not found!")
-            return False
+            return True  # Assume member if channel not found
         elif "forbidden" in error_msg:
-            # Bot can't access the channel (might be private)
-            log.error(f"Bot can't access @{channel}. Make sure channel is public or bot is added.")
-            return False
+            # Bot can't access the channel
+            log.error(f"Bot can't access @{channel}. Might be private or bot not admin.")
+            return True  # Assume member to avoid blocking
         else:
-            return False
+            # For other errors, don't cache and assume True to avoid blocking
+            return True
 
-async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
+async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, force_check: bool = False) -> Dict[str, Any]:
     """Check if user is member of both channels"""
     bot = context.bot
     
@@ -314,31 +317,35 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> 
         "missing_channels": []
     }
     
+    # Clear cache for this user when force checking
+    if force_check:
+        db.clear_membership_cache(user_id)
+    
     # Check first channel
     try:
-        ch1_result = await check_user_in_channel(bot, CHANNEL_1, user_id)
+        ch1_result = await check_user_in_channel(bot, CHANNEL_1, user_id, force_check)
         result["channel1"] = ch1_result
         if not ch1_result:
             result["missing_channels"].append(f"@{CHANNEL_1}")
     except Exception as e:
         log.error(f"Error checking channel 1: {e}")
-        result["channel1"] = False
-        result["missing_channels"].append(f"@{CHANNEL_1}")
+        result["channel1"] = True  # Assume true on error to not block
+        # Don't add to missing_channels on error
     
     # Check second channel
     try:
-        ch2_result = await check_user_in_channel(bot, CHANNEL_2, user_id)
+        ch2_result = await check_user_in_channel(bot, CHANNEL_2, user_id, force_check)
         result["channel2"] = ch2_result
         if not ch2_result:
             result["missing_channels"].append(f"@{CHANNEL_2}")
     except Exception as e:
         log.error(f"Error checking channel 2: {e}")
-        result["channel2"] = False
-        result["missing_channels"].append(f"@{CHANNEL_2}")
+        result["channel2"] = True  # Assume true on error to not block
+        # Don't add to missing_channels on error
     
     result["all_joined"] = result["channel1"] and result["channel2"]
     
-    log.info(f"Membership check for {user_id}: {result}")
+    log.info(f"Membership check for {user_id}: ch1={result['channel1']}, ch2={result['channel2']}, all={result['all_joined']}")
     return result
 
 # ============ WEB ROUTES ============
@@ -644,15 +651,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # No file key → show join info
         if not args:
-            keyboard = [
-                [InlineKeyboardButton("📢 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
-                [InlineKeyboardButton("📢 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")]
-            ]
+            keyboard = []
+            keyboard.append([InlineKeyboardButton("📢 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")])
+            keyboard.append([InlineKeyboardButton("📢 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")])
+            keyboard.append([InlineKeyboardButton("🔄 Check Membership", callback_data="check_membership")])
 
             await update.message.reply_text(
-                "🤖 File Sharing Bot\n\n"
-                "🔗 Use admin-provided links\n"
-                "📢 Join both channels to access files",
+                "🤖 *Welcome to File Sharing Bot*\n\n"
+                "🔗 *How to use:*\n"
+                "1️⃣ Use admin-provided links\n"
+                "2️⃣ Join both channels below\n"
+                "3️⃣ Click 'Check Membership' after joining\n\n"
+                "*Channels to join:*\n"
+                f"• @{CHANNEL_1}\n"
+                f"• @{CHANNEL_2}",
+                parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
             return
@@ -665,54 +678,91 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ File not found or expired")
             return
 
-        # Check membership
-        result = await check_membership(user_id, context)
+        # Check membership (force fresh check for start command)
+        result = await check_membership(user_id, context, force_check=True)
         
         if not result["all_joined"]:
-            # Show which channels are missing
-            message_text = "🔒 Join Required\n\n"
-            if result["missing_channels"]:
-                message_text += f"Please join: {', '.join(result['missing_channels'])}\n"
-            message_text += "\nJoin then click Check Again 👇"
+            # Show which channels are missing with better UI
+            missing_count = len(result["missing_channels"])
+            message_text = "🔒 *Access Required*\n\n"
+            
+            if missing_count == 2:
+                message_text += "⚠️ *You need to join both channels:*\n"
+            elif missing_count == 1:
+                message_text += "⚠️ *You need to join this channel:*\n"
+            
+            if not result["channel1"]:
+                message_text += f"• @{CHANNEL_1}\n"
+            if not result["channel2"]:
+                message_text += f"• @{CHANNEL_2}\n"
+            
+            message_text += "\n👉 *Join the channels and then click '✅ Check Again'*"
             
             keyboard = []
             if not result["channel1"]:
-                keyboard.append([InlineKeyboardButton(f"Join @{CHANNEL_1}", url=f"https://t.me/{CHANNEL_1}")])
+                keyboard.append([InlineKeyboardButton(f"📥 Join @{CHANNEL_1}", url=f"https://t.me/{CHANNEL_1}")])
             if not result["channel2"]:
-                keyboard.append([InlineKeyboardButton(f"Join @{CHANNEL_2}", url=f"https://t.me/{CHANNEL_2}")])
+                keyboard.append([InlineKeyboardButton(f"📥 Join @{CHANNEL_2}", url=f"https://t.me/{CHANNEL_2}")])
             keyboard.append([InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")])
 
             await update.message.reply_text(
                 message_text,
+                parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
             return
 
-        # Send file
-        filename = file_info['file_name']
-        ext = filename.lower().split('.')[-1] if '.' in filename else ""
-        
-        if file_info['is_video'] and ext in PLAYABLE_EXTS:
-            sent = await context.bot.send_video(
-                chat_id=chat_id,
-                video=file_info["file_id"],
-                caption=f"📹 {filename}",
-                supports_streaming=True
-            )
-        else:
-            sent = await context.bot.send_document(
-                chat_id=chat_id,
-                document=file_info["file_id"],
-                caption=f"📁 {filename}"
-            )
-
-        # Schedule deletion
-        if sent:
-            context.job_queue.run_once(
-                delete_job,
-                DELETE_AFTER,
-                data={"chat": chat_id, "msg": sent.message_id}
-            )
+        # User has joined both channels - send the file
+        try:
+            filename = file_info['file_name']
+            ext = filename.lower().split('.')[-1] if '.' in filename else ""
+            
+            if file_info['is_video'] and ext in PLAYABLE_EXTS:
+                # Send as playable video
+                sent = await context.bot.send_video(
+                    chat_id=chat_id,
+                    video=file_info["file_id"],
+                    caption=f"🎬 *{filename}*",
+                    parse_mode="Markdown",
+                    supports_streaming=True
+                )
+            else:
+                # Send as document
+                sent = await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=file_info["file_id"],
+                    caption=f"📁 *{filename}*",
+                    parse_mode="Markdown"
+                )
+            
+            # Schedule deletion
+            if sent:
+                context.job_queue.run_once(
+                    delete_job,
+                    DELETE_AFTER,
+                    data={"chat": chat_id, "msg": sent.message_id}
+                )
+                
+        except Exception as e:
+            log.error(f"Error sending file: {e}", exc_info=True)
+            # Try alternative method if first fails
+            try:
+                sent = await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=file_info["file_id"],
+                    caption=f"📁 *{filename}* (sent as document)",
+                    parse_mode="Markdown"
+                )
+                
+                if sent:
+                    context.job_queue.run_once(
+                        delete_job,
+                        DELETE_AFTER,
+                        data={"chat": chat_id, "msg": sent.message_id}
+                    )
+            except Exception as e2:
+                log.error(f"Alternative send also failed: {e2}")
+                await update.message.reply_text("❌ Failed to send file. Please try again later.")
 
     except Exception as e:
         log.error(f"Start error: {e}", exc_info=True)
@@ -728,80 +778,157 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         
         user_id = query.from_user.id
-        data_parts = query.data.split("|")
+        data = query.data
         
-        if len(data_parts) != 2:
-            return
-        
-        _, key = data_parts
-        
-        # Check if file exists
-        file_info = db.get_file(key)
-        if not file_info:
-            await query.edit_message_text("❌ File expired")
-            return
-        
-        # Check membership
-        result = await check_membership(user_id, context)
-        
-        if not result['all_joined']:
-            # Update message
-            text = "❌ Still not joined:\n"
-            if not result['channel1']:
-                text += f"\n• @{CHANNEL_1}"
-            if not result['channel2']:
-                text += f"\n• @{CHANNEL_2}"
+        # Handle membership check without file
+        if data == "check_membership":
+            result = await check_membership(user_id, context, force_check=True)
             
-            keyboard = []
-            if not result['channel1']:
-                keyboard.append([InlineKeyboardButton(f"Join @{CHANNEL_1}", url=f"https://t.me/{CHANNEL_1}")])
-            if not result['channel2']:
-                keyboard.append([InlineKeyboardButton(f"Join @{CHANNEL_2}", url=f"https://t.me/{CHANNEL_2}")])
-            keyboard.append([InlineKeyboardButton("🔄 Check Again", callback_data=f"check|{key}")])
-            
-            await query.edit_message_text(
-                text,
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            return
-        
-        # Send file
-        filename = file_info.get('file_name', 'file')
-        ext = filename.lower().split('.')[-1] if '.' in filename else ""
-        
-        try:
-            if file_info['is_video'] and ext in PLAYABLE_EXTS:
-                sent_msg = await context.bot.send_video(
-                    chat_id=query.message.chat_id,
-                    video=file_info["file_id"],
-                    caption=f"📹 {filename}",
-                    supports_streaming=True
+            if result["all_joined"]:
+                await query.edit_message_text(
+                    "✅ *Great! You've joined both channels!*\n\n"
+                    "Now you can use file links shared by the admin.",
+                    parse_mode="Markdown"
                 )
             else:
-                sent_msg = await context.bot.send_document(
-                    chat_id=query.message.chat_id,
-                    document=file_info["file_id"],
-                    caption=f"📁 {filename}"
+                message_text = "❌ *Membership Check Failed*\n\n"
+                missing_count = len(result["missing_channels"])
+                
+                if missing_count == 2:
+                    message_text += "You're not a member of either channel.\n"
+                elif missing_count == 1:
+                    message_text += "You're missing one channel.\n"
+                
+                if not result["channel1"]:
+                    message_text += f"• @{CHANNEL_1}\n"
+                if not result["channel2"]:
+                    message_text += f"• @{CHANNEL_2}\n"
+                
+                message_text += "\nJoin the channels and check again."
+                
+                keyboard = []
+                if not result["channel1"]:
+                    keyboard.append([InlineKeyboardButton(f"📥 Join @{CHANNEL_1}", url=f"https://t.me/{CHANNEL_1}")])
+                if not result["channel2"]:
+                    keyboard.append([InlineKeyboardButton(f"📥 Join @{CHANNEL_2}", url=f"https://t.me/{CHANNEL_2}")])
+                keyboard.append([InlineKeyboardButton("🔄 Check Again", callback_data="check_membership")])
+                
+                await query.edit_message_text(
+                    message_text,
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
                 )
-        except Exception as e:
-            log.error(f"Failed to send file: {e}")
-            await query.edit_message_text("❌ Failed to send file")
             return
         
-        await query.edit_message_text("✅ Access granted! File sent.")
-        
-        # Schedule deletion
-        if sent_msg:
-            context.job_queue.run_once(
-                delete_job,
-                DELETE_AFTER,
-                data={"chat": query.message.chat_id, "msg": sent_msg.message_id}
-            )
+        # Handle file access check
+        if data.startswith("check|"):
+            data_parts = data.split("|")
+            if len(data_parts) != 2:
+                return
+            
+            _, key = data_parts
+            
+            # Check if file exists
+            file_info = db.get_file(key)
+            if not file_info:
+                await query.edit_message_text("❌ File expired")
+                return
+            
+            # Check membership with force check (clear cache)
+            result = await check_membership(user_id, context, force_check=True)
+            
+            if not result['all_joined']:
+                # Update message
+                text = "❌ *Still Not Joined*\n\n"
+                missing_count = len(result["missing_channels"])
+                
+                if missing_count == 2:
+                    text += "You need to join both channels:\n"
+                else:
+                    text += "You need to join this channel:\n"
+                
+                if not result['channel1']:
+                    text += f"• @{CHANNEL_1}\n"
+                if not result['channel2']:
+                    text += f"• @{CHANNEL_2}\n"
+                
+                text += "\nJoin and click 'Check Again'"
+                
+                keyboard = []
+                if not result['channel1']:
+                    keyboard.append([InlineKeyboardButton(f"📥 Join @{CHANNEL_1}", url=f"https://t.me/{CHANNEL_1}")])
+                if not result['channel2']:
+                    keyboard.append([InlineKeyboardButton(f"📥 Join @{CHANNEL_2}", url=f"https://t.me/{CHANNEL_2}")])
+                keyboard.append([InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")])
+                
+                await query.edit_message_text(
+                    text,
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                return
+            
+            # User has joined both channels - send the file
+            try:
+                filename = file_info.get('file_name', 'file')
+                ext = filename.lower().split('.')[-1] if '.' in filename else ""
+                
+                if file_info['is_video'] and ext in PLAYABLE_EXTS:
+                    sent_msg = await context.bot.send_video(
+                        chat_id=query.message.chat_id,
+                        video=file_info["file_id"],
+                        caption=f"🎬 *{filename}*",
+                        parse_mode="Markdown",
+                        supports_streaming=True
+                    )
+                else:
+                    sent_msg = await context.bot.send_document(
+                        chat_id=query.message.chat_id,
+                        document=file_info["file_id"],
+                        caption=f"📁 *{filename}*",
+                        parse_mode="Markdown"
+                    )
+                
+                await query.edit_message_text("✅ *Access granted! File sent below.*", parse_mode="Markdown")
+                
+                # Schedule deletion
+                if sent_msg:
+                    context.job_queue.run_once(
+                        delete_job,
+                        DELETE_AFTER,
+                        data={"chat": query.message.chat_id, "msg": sent_msg.message_id}
+                    )
+                
+            except Exception as e:
+                log.error(f"Failed to send file in callback: {e}")
+                # Try alternative method
+                try:
+                    sent_msg = await context.bot.send_document(
+                        chat_id=query.message.chat_id,
+                        document=file_info["file_id"],
+                        caption=f"📁 *{filename}* (sent as document)",
+                        parse_mode="Markdown"
+                    )
+                    
+                    await query.edit_message_text("✅ *Access granted! File sent below.*", parse_mode="Markdown")
+                    
+                    if sent_msg:
+                        context.job_queue.run_once(
+                            delete_job,
+                            DELETE_AFTER,
+                            data={"chat": query.message.chat_id, "msg": sent_msg.message_id}
+                        )
+                except Exception as e2:
+                    log.error(f"Alternative send also failed in callback: {e2}")
+                    await query.edit_message_text("❌ Failed to send file. Please try again.")
         
     except Exception as e:
         log.error(f"Callback error: {e}", exc_info=True)
         if update.callback_query:
-            await update.callback_query.answer("Error occurred", show_alert=True)
+            try:
+                await update.callback_query.answer("An error occurred. Please try again.", show_alert=True)
+            except:
+                pass
 
 async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -833,9 +960,6 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             if ext in ALL_VIDEO_EXTS:
                 is_video = True
-                if ext in {"mkv", "avi", "webm", "flv"}:
-                    # These will be sent as documents
-                    pass
         else:
             await msg.reply_text("❌ Please send a video or document")
             return
@@ -845,19 +969,20 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "file_name": filename,
             "mime_type": mime_type,
             "is_video": is_video,
-            "size": int(file_size)
+            "size": int(file_size) if file_size else 0
         }
 
         key = db.save_file(file_id, file_info)
         link = f"https://t.me/{bot_username}?start={key}"
 
         await msg.reply_text(
-            f"✅ Upload Successful\n\n"
-            f"📁 Name: {filename}\n"
-            f"🎬 Type: {'Video' if is_video else 'Document'}\n"
-            f"📦 Size: {file_size/1024/1024:.1f} MB\n"
-            f"🔑 Key: {key}\n\n"
-            f"🔗 Link:\n{link}"
+            f"✅ *Upload Successful*\n\n"
+            f"📁 *Name:* `{filename}`\n"
+            f"🎬 *Type:* {'Video' if is_video else 'Document'}\n"
+            f"📦 *Size:* {file_size/1024/1024:.1f} MB\n"
+            f"🔑 *Key:* `{key}`\n\n"
+            f"🔗 *Link:*\n`{link}`",
+            parse_mode="Markdown"
         )
 
     except Exception as e:
@@ -882,6 +1007,9 @@ def start_bot():
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("clearcache", clearcache))
     application.add_handler(CommandHandler("testchannel", testchannel))
+    
+    # Add callback query handlers
+    application.add_handler(CallbackQueryHandler(check_join, pattern=r"^check_membership$"))
     application.add_handler(CallbackQueryHandler(check_join, pattern=r"^check\|"))
 
     upload_filter = filters.VIDEO | filters.Document.ALL
