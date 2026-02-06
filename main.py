@@ -468,7 +468,7 @@ def home():
             <ul>
                 <li>Service: <strong>Render Web Service</strong></li>
                 <li>Bot: <strong>@{{ bot_username }}</strong></li>
-                <li>Channels: <strong>@{{ channel1 }}, @{ channel2 }}</strong></li>
+                <li>Channels: <strong>@{{ channel1 }}, @{{ channel2 }}</strong></li>
                 <li>File Storage: <strong>PERMANENT</strong></li>
                 <li>Message Auto-delete: <strong>{{ delete_minutes }} minutes</strong></li>
             </ul>
@@ -975,19 +975,13 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 message_text += "\nJoin the channels and check again."
                 
-                # keyboard = []
-                # if not result["channel1"]:
-                #     keyboard.append([InlineKeyboardButton(f"📥 Join @{CHANNEL_1}", url=f"https://t.me/{CHANNEL_1}")])
-                # if not result["channel2"]:
-                #     keyboard.append([InlineKeyboardButton(f"📥 Join @{CHANNEL_2}", url=f"https://t.me/{CHANNEL_2}")])
-                # keyboard.append([InlineKeyboardButton("🔄 Check Again", callback_data="check_membership")])
-
                 keyboard = []
                 if not result["channel1"]:
-                keyboard.append([InlineKeyboardButton(f"📥 Join @{CHANNEL_1}", url=f"https://t.me/{CHANNEL_1}")])
+                    keyboard.append([InlineKeyboardButton(f"📥 Join @{CHANNEL_1}", url=f"https://t.me/{CHANNEL_1}")])
                 if not result["channel2"]:
-                keyboard.append([InlineKeyboardButton(f"📥 Join @{CHANNEL_2}", url=f"https://t.me/{CHANNEL_2}")])
+                    keyboard.append([InlineKeyboardButton(f"📥 Join @{CHANNEL_2}", url=f"https://t.me/{CHANNEL_2}")])
                 keyboard.append([InlineKeyboardButton("🔄 Check Again", callback_data="check_membership")])
+
                 await query.edit_message_text(
                     message_text,
                     parse_mode="Markdown",
