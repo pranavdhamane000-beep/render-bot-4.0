@@ -44,8 +44,8 @@ CHANNEL_2 = os.environ.get("CHANNEL_2", "your_movies_web").replace("@", "")
 
 # SQLite database for persistent storage
 DB_PATH = Path("file_bot.db")
-DELETE_AFTER = 600  # 10 minutes - DELETE MESSAGES ONLY
-MAX_STORED_FILES = 1000  # Increased limit for storing more files
+DELETE_AFTER = 600  # 10 minutes - DELETE ALL BOT MESSAGES
+MAX_STORED_FILES = 1000
 AUTO_CLEANUP_DAYS = 0  # Set to 0 to NEVER auto-cleanup files
 
 # Playable formats
@@ -271,6 +271,56 @@ class Database:
 
 # Initialize database
 db = Database()
+
+# ============ HELPER FUNCTION TO SCHEDULE MESSAGE DELETION ============
+async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
+    """Schedule a message for deletion after DELETE_AFTER seconds"""
+    if not context.job_queue:
+        log.warning(f"Job queue not available - cannot schedule deletion for message {message_id}")
+        return
+    
+    try:
+        # Store chat_id in job.chat_id and message_id in job.data
+        context.job_queue.run_once(
+            delete_message_job,
+            DELETE_AFTER,
+            data=message_id,
+            chat_id=chat_id,
+            name=f"delete_msg_{chat_id}_{message_id}_{int(time.time())}"
+        )
+        log.info(f"Scheduled deletion of message {message_id} from chat {chat_id} in {DELETE_AFTER} seconds")
+    except Exception as e:
+        log.error(f"Failed to schedule deletion for message {message_id}: {e}")
+
+async def delete_message_job(context):
+    """Delete message after timer"""
+    try:
+        job = context.job
+        chat_id = job.chat_id
+        message_id = job.data
+        
+        if not chat_id or not message_id:
+            log.warning(f"Invalid delete job data: chat_id={chat_id}, message_id={message_id}")
+            return
+        
+        log.info(f"Attempting to delete message {message_id} from chat {chat_id}")
+        
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            log.info(f"✅ Successfully deleted message {message_id} from chat {chat_id}")
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "message to delete not found" in error_msg:
+                log.info(f"Message {message_id} already deleted from chat {chat_id}")
+            elif "message can't be deleted" in error_msg:
+                log.warning(f"Can't delete message {message_id} - insufficient permissions in chat {chat_id}")
+            elif "chat not found" in error_msg:
+                log.info(f"Chat {chat_id} not found - message probably already deleted")
+            else:
+                log.error(f"Failed to delete message {message_id} from chat {chat_id}: {e}")
+                
+    except Exception as e:
+        log.error(f"Error in delete_message_job: {e}", exc_info=True)
 
 # ============ FIXED MEMBERSHIP CHECK ============
 async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bool = False) -> bool:
@@ -544,37 +594,6 @@ def run_flask_thread():
     
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False, threaded=True)
 
-# ============ FIXED DELETE FUNCTION ============
-async def delete_job(context):
-    """Delete message after timer - ONLY deletes the message, not file from database"""
-    try:
-        job = context.job
-        chat_id = job.chat_id
-        message_id = job.data
-        
-        if not chat_id or not message_id:
-            log.warning(f"Invalid delete job data: chat_id={chat_id}, message_id={message_id}")
-            return
-        
-        log.info(f"Attempting to delete message {message_id} from chat {chat_id}")
-        
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-            log.info(f"Successfully deleted message {message_id} from chat {chat_id}")
-        except Exception as e:
-            error_msg = str(e).lower()
-            if "message to delete not found" in error_msg:
-                log.info(f"Message {message_id} already deleted from chat {chat_id}")
-            elif "message can't be deleted" in error_msg:
-                log.warning(f"Can't delete message {message_id} - insufficient permissions in chat {chat_id}")
-            elif "chat not found" in error_msg:
-                log.info(f"Chat {chat_id} not found - message probably already deleted")
-            else:
-                log.error(f"Failed to delete message {message_id} from chat {chat_id}: {e}")
-                
-    except Exception as e:
-        log.error(f"Error in delete_job: {e}", exc_info=True)
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Error handler"""
     log.error(f"Error: {context.error}", exc_info=True)
@@ -615,7 +634,9 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"🗑️ Files older than {days} days removed: {deleted}\n\n"
         msg += f"⚠️ Note: Auto-cleanup is DISABLED. Files are kept permanently by default."
         
-        await update.message.reply_text(msg)
+        sent_msg = await update.message.reply_text(msg)
+        # Schedule this message for deletion too
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         
     except Exception as e:
         await update.message.reply_text(f"❌ Cleanup failed: {str(e)[:100]}")
@@ -626,11 +647,13 @@ async def deletefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if not context.args:
-        await update.message.reply_text(
+        sent_msg = await update.message.reply_text(
             "❌ Usage: /deletefile <file_key>\n\n"
             "Example: /deletefile 123\n\n"
             "Use /listfiles to see all files"
         )
+        # Schedule this message for deletion
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
     
     key = context.args[0]
@@ -638,21 +661,24 @@ async def deletefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # First check if file exists
     file_info = db.get_file(key)
     if not file_info:
-        await update.message.reply_text(f"❌ File with key '{key}' not found in database")
+        sent_msg = await update.message.reply_text(f"❌ File with key '{key}' not found in database")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
     
     filename = file_info.get('file_name', 'Unknown')
     
     # Delete from database
     if db.delete_file(key):
-        await update.message.reply_text(
+        sent_msg = await update.message.reply_text(
             f"✅ File deleted from database\n\n"
             f"🔑 Key: {key}\n"
             f"📁 Name: {filename}\n\n"
             f"⚠️ This file can no longer be accessed by users"
         )
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
     else:
-        await update.message.reply_text(f"❌ Failed to delete file '{key}'")
+        sent_msg = await update.message.reply_text(f"❌ Failed to delete file '{key}'")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def listfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all files in database"""
@@ -663,7 +689,8 @@ async def listfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
         files = db.get_all_files()
         
         if not files:
-            await update.message.reply_text("📁 Database is empty. No files stored.")
+            sent_msg = await update.message.reply_text("📁 Database is empty. No files stored.")
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
         
         total_size = 0
@@ -705,14 +732,18 @@ async def listfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if len(full_message) > 4000:
             # Split if too long
-            await update.message.reply_text(full_message[:4000])
-            await update.message.reply_text(full_message[4000:])
+            sent_msg1 = await update.message.reply_text(full_message[:4000], parse_mode="Markdown")
+            sent_msg2 = await update.message.reply_text(full_message[4000:], parse_mode="Markdown")
+            await schedule_message_deletion(context, sent_msg1.chat_id, sent_msg1.message_id)
+            await schedule_message_deletion(context, sent_msg2.chat_id, sent_msg2.message_id)
         else:
-            await update.message.reply_text(full_message, parse_mode="Markdown")
+            sent_msg = await update.message.reply_text(full_message, parse_mode="Markdown")
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             
     except Exception as e:
         log.error(f"Error listing files: {e}")
-        await update.message.reply_text(f"❌ Error listing files: {str(e)[:200]}")
+        sent_msg = await update.message.reply_text(f"❌ Error listing files: {str(e)[:200]}")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -732,7 +763,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-    await update.message.reply_text(
+    sent_msg = await update.message.reply_text(
         f"📊 Bot Statistics\n\n"
         f"🤖 Bot: @{bot_username}\n"
         f"⏱ Uptime: {uptime_str}\n"
@@ -749,6 +780,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/deletefile <key> - Delete specific file\n"
         f"/cleanup [days] - Manual cleanup (optional)"
     )
+    await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def clearcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Clear membership cache"""
@@ -760,15 +792,18 @@ async def clearcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             user_id = int(context.args[0])
         except ValueError:
-            await update.message.reply_text("Usage: /clearcache [user_id]")
+            sent_msg = await update.message.reply_text("Usage: /clearcache [user_id]")
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
     
     db.clear_membership_cache(user_id)
     
     if user_id:
-        await update.message.reply_text(f"✅ Cleared cache for user {user_id}")
+        sent_msg = await update.message.reply_text(f"✅ Cleared cache for user {user_id}")
     else:
-        await update.message.reply_text("✅ Cleared all membership cache")
+        sent_msg = await update.message.reply_text("✅ Cleared all membership cache")
+    
+    await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Test if bot can access channels"""
@@ -792,13 +827,15 @@ async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             ch2_status = f"❌ Error: {str(e)[:100]}"
         
-        await update.message.reply_text(
+        sent_msg = await update.message.reply_text(
             f"🔍 Channel Access Test\n\n"
             f"Channel 1 (@{CHANNEL_1}):\n{ch1_status}\n\n"
             f"Channel 2 (@{CHANNEL_2}):\n{ch2_status}"
         )
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
     except Exception as e:
-        await update.message.reply_text(f"❌ Test failed: {e}")
+        sent_msg = await update.message.reply_text(f"❌ Test failed: {e}")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -816,17 +853,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append([InlineKeyboardButton("📢 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")])
             keyboard.append([InlineKeyboardButton("🔄 Check Membership", callback_data="check_membership")])
 
-            await update.message.reply_text(
+            sent_msg = await update.message.reply_text(
                 "🤖 *Welcome to File Sharing Bot*\n\n"
                 "🔗 *How to use:*\n"
                 "1️⃣ Use admin-provided links\n"
                 "2️⃣ Join both channels below\n"
                 "3️⃣ Click 'Check Membership' after joining\n\n"
-                f"⚠️ *Note:* Files will auto-delete from chat after {DELETE_AFTER//60} minutes\n"
+                f"⚠️ *Note:* All bot messages auto-delete after {DELETE_AFTER//60} minutes\n"
                 "💾 *Storage:* Files are stored permanently in database",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
+            # Schedule this message for deletion
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
         # File key exists
@@ -834,41 +873,50 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_info = db.get_file(key)
         
         if not file_info:
-            await update.message.reply_text("❌ File not found. It may have been manually deleted by admin.")
+            sent_msg = await update.message.reply_text("❌ File not found. It may have been manually deleted by admin.")
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
         # Check membership (force fresh check for start command)
         result = await check_membership(user_id, context, force_check=True)
         
         if not result["all_joined"]:
-            # Show which channels are missing with better UI
+            # Show which channels are missing with better UI - FIXED TO SHOW SINGLE BUTTON
             missing_count = len(result["missing_channels"])
+            
+            # Create message with cleaner formatting
             message_text = "🔒 *Access Required*\n\n"
             
             if missing_count == 2:
-                message_text += "⚠️ *You need to join both channels:*\n"
+                message_text += "⚠️ *You need to join both channels to access this file:*\n"
+                # Create buttons for each channel
+                keyboard = [
+                    [InlineKeyboardButton(f"📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
+                    [InlineKeyboardButton(f"📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")],
+                    [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
+                ]
             elif missing_count == 1:
-                message_text += "⚠️ *You need to join this channel:*\n"
+                # Only show button for the missing channel
+                missing_channel = result["missing_channels"][0].replace("@", "")
+                channel_name = "Channel 1" if CHANNEL_1 in missing_channel else "Channel 2"
+                
+                message_text += f"⚠️ *You need to join {channel_name} to access this file:*\n"
+                
+                # Create single button for the missing channel
+                keyboard = [
+                    [InlineKeyboardButton(f"📥 Join {channel_name}", url=f"https://t.me/{missing_channel}")],
+                    [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
+                ]
             
-            if not result["channel1"]:
-                message_text += f"• @{CHANNEL_1}\n"
-            if not result["channel2"]:
-                message_text += f"• @{CHANNEL_2}\n"
-            
-            message_text += "\n👉 *Join the channels and then click '✅ Check Again'*"
-            
-            keyboard = []
-            if not result["channel1"]:
-                keyboard.append([InlineKeyboardButton(f"📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")])
-            if not result["channel2"]:
-                keyboard.append([InlineKeyboardButton(f"📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")])
-            keyboard.append([InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")])
+            message_text += "\n👉 *Join the channel(s) and then click '✅ Check Again'*"
 
-            await update.message.reply_text(
+            sent_msg = await update.message.reply_text(
                 message_text,
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
+            # Schedule this message for deletion
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
         # User has joined both channels - send the file
@@ -900,18 +948,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             
             # Schedule deletion of the MESSAGE (not file from database)
-            if sent and context.job_queue:
-                # Store chat_id in job.chat_id and message_id in job.data
-                context.job_queue.run_once(
-                    delete_job,
-                    DELETE_AFTER,
-                    data=sent.message_id,
-                    chat_id=chat_id,
-                    name=f"delete_msg_{chat_id}_{sent.message_id}"
-                )
-                log.info(f"Scheduled deletion of message {sent.message_id} from chat {chat_id} in {DELETE_AFTER} seconds")
-            elif sent:
-                log.warning(f"Job queue not available for message {sent.message_id}")
+            await schedule_message_deletion(context, sent.chat_id, sent.message_id)
                 
         except Exception as e:
             log.error(f"Error sending file: {e}", exc_info=True)
@@ -920,13 +957,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             error_msg = str(e).lower()
             
             if "file is too big" in error_msg or "too large" in error_msg:
-                await update.message.reply_text("❌ File is too large. Maximum size is 50MB for videos.")
+                sent_msg = await update.message.reply_text("❌ File is too large. Maximum size is 50MB for videos.")
             elif "file not found" in error_msg or "invalid file id" in error_msg:
-                await update.message.reply_text("❌ File expired from Telegram servers. Please contact admin.")
+                sent_msg = await update.message.reply_text("❌ File expired from Telegram servers. Please contact admin.")
             elif "forbidden" in error_msg:
-                await update.message.reply_text("❌ Bot can't send messages here.")
+                sent_msg = await update.message.reply_text("❌ Bot can't send messages here.")
             else:
-                await update.message.reply_text("❌ Failed to send file. Please try again.")
+                sent_msg = await update.message.reply_text("❌ Failed to send file. Please try again.")
+            
+            # Schedule error message for deletion
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             
             # Log detailed error
             log.error(f"File send failed for {key}: {traceback.format_exc()}")
@@ -934,7 +974,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error(f"Start error: {e}", exc_info=True)
         if update.message:
-            await update.message.reply_text("❌ Error processing request")
+            sent_msg = await update.message.reply_text("❌ Error processing request")
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle check membership callback"""
@@ -955,7 +996,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(
                     f"✅ *Great! You've joined both channels!*\n\n"
                     "Now you can use file links shared by the admin.\n"
-                    f"⚠️ *Note:* Files will auto-delete from chat after {DELETE_AFTER//60} minutes\n"
+                    f"⚠️ *Note:* All bot messages auto-delete after {DELETE_AFTER//60} minutes\n"
                     "💾 *Storage:* Files are stored permanently in database",
                     parse_mode="Markdown"
                 )
@@ -965,22 +1006,26 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 if missing_count == 2:
                     message_text += "You're not a member of either channel.\n"
+                    # Create buttons for each channel
+                    keyboard = [
+                        [InlineKeyboardButton(f"📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
+                        [InlineKeyboardButton(f"📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")],
+                        [InlineKeyboardButton("🔄 Check Again", callback_data="check_membership")]
+                    ]
                 elif missing_count == 1:
-                    message_text += "You're missing one channel.\n"
+                    # Only show button for the missing channel
+                    missing_channel = result["missing_channels"][0].replace("@", "")
+                    channel_name = "Channel 1" if CHANNEL_1 in missing_channel else "Channel 2"
+                    
+                    message_text += f"You're missing {channel_name}.\n"
+                    
+                    # Create single button for the missing channel
+                    keyboard = [
+                        [InlineKeyboardButton(f"📥 Join {channel_name}", url=f"https://t.me/{missing_channel}")],
+                        [InlineKeyboardButton("🔄 Check Again", callback_data="check_membership")]
+                    ]
                 
-                if not result["channel1"]:
-                    message_text += f"• @{CHANNEL_1}\n"
-                if not result["channel2"]:
-                    message_text += f"• @{CHANNEL_2}\n"
-                
-                message_text += "\nJoin the channels and check again."
-                
-                keyboard = []
-                if not result["channel1"]:
-                    keyboard.append([InlineKeyboardButton(f"📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")])
-                if not result["channel2"]:
-                    keyboard.append([InlineKeyboardButton(f"📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")])
-                keyboard.append([InlineKeyboardButton("🔄 Check Again", callback_data="check_membership")])
+                message_text += "\nJoin the channel(s) and check again."
 
                 await query.edit_message_text(
                     message_text,
@@ -998,37 +1043,46 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _, key = data_parts
             
             # Check if file exists in database
-            file_info = db.get_file(key)
-            if not file_info:
-                await query.edit_message_text("❌ File not found. It may have been manually deleted by admin.")
+            try:
+                file_info = db.get_file(key)
+                if not file_info:
+                    await query.edit_message_text("❌ File not found. It may have been manually deleted by admin.")
+                    return
+            except Exception as e:
+                log.error(f"Database error when getting file {key}: {e}")
+                await query.edit_message_text("❌ Error accessing file. Please try again.")
                 return
             
             # Check membership with force check (clear cache)
             result = await check_membership(user_id, context, force_check=True)
             
             if not result['all_joined']:
-                # Update message
+                # Update message with cleaner UI
                 text = "❌ *Still Not Joined*\n\n"
                 missing_count = len(result["missing_channels"])
                 
                 if missing_count == 2:
                     text += "You need to join both channels:\n"
-                else:
-                    text += "You need to join this channel:\n"
-                
-                if not result['channel1']:
-                    text += f"• @{CHANNEL_1}\n"
-                if not result['channel2']:
-                    text += f"• @{CHANNEL_2}\n"
+                    # Create buttons for each channel
+                    keyboard = [
+                        [InlineKeyboardButton(f"📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
+                        [InlineKeyboardButton(f"📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")],
+                        [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
+                    ]
+                elif missing_count == 1:
+                    # Only show button for the missing channel
+                    missing_channel = result["missing_channels"][0].replace("@", "")
+                    channel_name = "Channel 1" if CHANNEL_1 in missing_channel else "Channel 2"
+                    
+                    text += f"You need to join {channel_name}:\n"
+                    
+                    # Create single button for the missing channel
+                    keyboard = [
+                        [InlineKeyboardButton(f"📥 Join {channel_name}", url=f"https://t.me/{missing_channel}")],
+                        [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
+                    ]
                 
                 text += "\nJoin and click 'Check Again'"
-                
-                keyboard = []
-                if not result['channel1']:
-                    keyboard.append([InlineKeyboardButton(f"📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")])
-                if not result['channel2']:
-                    keyboard.append([InlineKeyboardButton(f"📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")])
-                keyboard.append([InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")])
                 
                 await query.edit_message_text(
                     text,
@@ -1067,19 +1121,8 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 await query.edit_message_text("✅ *Access granted! File sent below.*", parse_mode="Markdown")
                 
-                # Schedule deletion of the MESSAGE (not file from database)
-                if sent_msg and context.job_queue:
-                    # Store chat_id in job.chat_id and message_id in job.data
-                    context.job_queue.run_once(
-                        delete_job,
-                        DELETE_AFTER,
-                        data=sent_msg.message_id,
-                        chat_id=chat_id,
-                        name=f"delete_callback_{chat_id}_{sent_msg.message_id}"
-                    )
-                    log.info(f"Scheduled deletion of callback message {sent_msg.message_id} from chat {chat_id} in {DELETE_AFTER} seconds")
-                elif sent_msg:
-                    log.warning(f"Job queue not available for callback message {sent_msg.message_id}")
+                # Schedule deletion of the FILE MESSAGE
+                await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
                 
             except Exception as e:
                 log.error(f"Failed to send file in callback: {e}", exc_info=True)
@@ -1134,7 +1177,8 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ext in ALL_VIDEO_EXTS:
                 is_video = True
         else:
-            await msg.reply_text("❌ Please send a video or document")
+            sent_msg = await msg.reply_text("❌ Please send a video or document")
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
         # Save to database
@@ -1148,7 +1192,7 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key = db.save_file(file_id, file_info)
         link = f"https://t.me/{bot_username}?start={key}"
 
-        await msg.reply_text(
+        sent_msg = await msg.reply_text(
             f"✅ *Upload Successful*\n\n"
             f"📁 *Name:* `{filename}`\n"
             f"🎬 *Type:* {'Video' if is_video else 'Document'}\n"
@@ -1160,10 +1204,13 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⚠️ *Note:* File will be stored FOREVER unless manually deleted",
             parse_mode="Markdown"
         )
+        # Schedule this upload confirmation message for deletion
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
     except Exception as e:
         log.exception("Upload error")
-        await update.message.reply_text(f"❌ Upload failed: {str(e)[:200]}")
+        sent_msg = await update.message.reply_text(f"❌ Upload failed: {str(e)[:200]}")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 def start_bot():
     if not BOT_TOKEN:
@@ -1181,7 +1228,7 @@ def start_bot():
     if application.job_queue:
         print("🟢 Job queue initialized")
     else:
-        print("⚠️ Job queue not available - auto-delete feature may not work")
+        print("⚠️ Job queue not available - auto-delete feature will not work")
 
     # Add handlers
     application.add_error_handler(error_handler)
@@ -1206,7 +1253,7 @@ def start_bot():
     print(f"🟢 Bot username: @{bot_username}")
     print(f"🟢 Admin ID: {ADMIN_ID}")
     print(f"🟢 Channels: @{CHANNEL_1}, @{CHANNEL_2}")
-    print(f"🟢 Message auto-delete from chat: {DELETE_AFTER//60} minutes")
+    print(f"🟢 ALL bot messages auto-delete after: {DELETE_AFTER//60} minutes")
     print(f"🟢 Database auto-cleanup: DISABLED (files stored permanently)")
     print(f"🟢 Max stored files: {MAX_STORED_FILES}")
     print("\n⚠️ IMPORTANT: Files are stored PERMANENTLY in database!")
@@ -1250,7 +1297,7 @@ def main():
 
     print(f"🟢 Admin ID: {ADMIN_ID}")
     print(f"🟢 Channels: @{CHANNEL_1}, @{CHANNEL_2}")
-    print(f"🟢 Message auto-delete from chat: {DELETE_AFTER//60} minutes")
+    print(f"🟢 ALL bot messages auto-delete after: {DELETE_AFTER//60} minutes")
     print(f"🟢 Database storage: PERMANENT (no auto-cleanup)")
     print(f"🟢 Max files: {MAX_STORED_FILES}")
     print("\n⚠️ FILES WILL BE STORED FOREVER IN DATABASE!")
