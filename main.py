@@ -675,10 +675,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🔗 *How to use:*\n"
                 "1️⃣ Use admin-provided links\n"
                 "2️⃣ Join both channels below\n"
-                "3️⃣ Click 'Check Membership' after joining\n\n"
-                "*Channels to join:*\n"
-                f"• @{CHANNEL_1}\n"
-                f"• @{CHANNEL_2}",
+                "3️⃣ Click 'Check Membership' after joining\n\n",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
