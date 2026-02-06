@@ -511,20 +511,34 @@ def run_flask_thread():
     
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False, threaded=True)
 
-# ============ BOT COMMANDS ============
+# ============ FIXED DELETE FUNCTION ============
 async def delete_job(context):
-    """Delete message"""
-    job = context.job
-    chat_id = job.data.get("chat")
-    message_id = job.data.get("msg")
-    
-    if not chat_id or not message_id:
-        return
-    
+    """Delete message after timer"""
     try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception:
-        pass
+        job = context.job
+        chat_id = job.data.get("chat")
+        message_id = job.data.get("msg")
+        
+        if not chat_id or not message_id:
+            log.warning(f"Invalid delete job data: {job.data}")
+            return
+        
+        log.info(f"Deleting message {message_id} in chat {chat_id}")
+        
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            log.info(f"Successfully deleted message {message_id}")
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "message to delete not found" in error_msg:
+                log.info(f"Message {message_id} already deleted")
+            elif "message can't be deleted" in error_msg:
+                log.warning(f"Can't delete message {message_id} - insufficient permissions")
+            else:
+                log.error(f"Failed to delete message {message_id}: {e}")
+                
+    except Exception as e:
+        log.error(f"Error in delete_job: {e}", exc_info=True)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Error handler"""
@@ -717,12 +731,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filename = file_info['file_name']
             ext = filename.lower().split('.')[-1] if '.' in filename else ""
             
+            # Add warning message to caption
+            warning_msg = "\n\n⚠️ *This file will be deleted in 10 minutes*\n📤 *Forward to saved messages to keep it*"
+            
             if file_info['is_video'] and ext in PLAYABLE_EXTS:
                 # Send as playable video
                 sent = await context.bot.send_video(
                     chat_id=chat_id,
                     video=file_info["file_id"],
-                    caption=f"🎬 *{filename}*",
+                    caption=f"🎬 *{filename}*{warning_msg}",
                     parse_mode="Markdown",
                     supports_streaming=True
                 )
@@ -731,24 +748,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sent = await context.bot.send_document(
                     chat_id=chat_id,
                     document=file_info["file_id"],
-                    caption=f"📁 *{filename}*",
+                    caption=f"📁 *{filename}*{warning_msg}",
                     parse_mode="Markdown"
                 )
             
-            # Schedule deletion with safety check - FIXED HERE
-            if sent and hasattr(context, 'job_queue') and context.job_queue:
+            # Schedule deletion with safety check - FIXED
+            if sent and context.job_queue:
                 context.job_queue.run_once(
                     delete_job,
                     DELETE_AFTER,
-                    data={"chat": chat_id, "msg": sent.message_id}
+                    data={"chat": chat_id, "msg": sent.message_id},
+                    name=f"delete_{chat_id}_{sent.message_id}"
                 )
+                log.info(f"Scheduled deletion of message {sent.message_id} in {DELETE_AFTER} seconds")
             elif sent:
                 log.warning(f"Job queue not available for message {sent.message_id}")
                 
         except Exception as e:
             log.error(f"Error sending file: {e}", exc_info=True)
             
-            # More specific error messages - FIXED HERE
+            # More specific error messages
             error_msg = str(e).lower()
             
             if "file is too big" in error_msg or "too large" in error_msg:
@@ -872,11 +891,14 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 filename = file_info.get('file_name', 'file')
                 ext = filename.lower().split('.')[-1] if '.' in filename else ""
                 
+                # Add warning message to caption
+                warning_msg = "\n\n⚠️ *This file will be deleted in 10 minutes*\n📤 *Forward to saved messages to keep it*"
+                
                 if file_info['is_video'] and ext in PLAYABLE_EXTS:
                     sent_msg = await context.bot.send_video(
                         chat_id=query.message.chat_id,
                         video=file_info["file_id"],
-                        caption=f"🎬 *{filename}*",
+                        caption=f"🎬 *{filename}*{warning_msg}",
                         parse_mode="Markdown",
                         supports_streaming=True
                     )
@@ -884,19 +906,21 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     sent_msg = await context.bot.send_document(
                         chat_id=query.message.chat_id,
                         document=file_info["file_id"],
-                        caption=f"📁 *{filename}*",
+                        caption=f"📁 *{filename}*{warning_msg}",
                         parse_mode="Markdown"
                     )
                 
                 await query.edit_message_text("✅ *Access granted! File sent below.*", parse_mode="Markdown")
                 
-                # Schedule deletion with safety check - FIXED HERE
-                if sent_msg and hasattr(context, 'job_queue') and context.job_queue:
+                # Schedule deletion with safety check - FIXED
+                if sent_msg and context.job_queue:
                     context.job_queue.run_once(
                         delete_job,
                         DELETE_AFTER,
-                        data={"chat": query.message.chat_id, "msg": sent_msg.message_id}
+                        data={"chat": query.message.chat_id, "msg": sent_msg.message_id},
+                        name=f"delete_callback_{query.message.chat_id}_{sent_msg.message_id}"
                     )
+                    log.info(f"Scheduled deletion of callback message {sent_msg.message_id} in {DELETE_AFTER} seconds")
                 elif sent_msg:
                     log.warning(f"Job queue not available for callback message {sent_msg.message_id}")
                 
@@ -1020,6 +1044,7 @@ def start_bot():
     print(f"🟢 Bot username: @{bot_username}")
     print(f"🟢 Admin ID: {ADMIN_ID}")
     print(f"🟢 Channels: @{CHANNEL_1}, @{CHANNEL_2}")
+    print(f"🟢 Auto-delete: {DELETE_AFTER//60} minutes")
     print("\n⚠️ IMPORTANT: Channels must be PUBLIC for membership check!")
     print("Use /testchannel to test channel access")
     print("Use /clearcache to clear membership cache")
@@ -1056,6 +1081,7 @@ def main():
 
     print(f"🟢 Admin ID: {ADMIN_ID}")
     print(f"🟢 Channels: @{CHANNEL_1}, @{CHANNEL_2}")
+    print(f"🟢 Auto-delete timer: {DELETE_AFTER//60} minutes")
     
     # Start Flask
     print("\n🟢 Starting Flask web dashboard...")
