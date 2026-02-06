@@ -103,8 +103,19 @@ class Database:
                     PRIMARY KEY (user_id, channel)
                 )
             ''')
+            # Table to track scheduled deletions
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS scheduled_deletions (
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    scheduled_time DATETIME NOT NULL,
+                    delete_after INTEGER DEFAULT 600,
+                    PRIMARY KEY (chat_id, message_id)
+                )
+            ''')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_cache_timestamp ON membership_cache(timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_deletions_time ON scheduled_deletions(scheduled_time)')
             conn.commit()
 
     @contextmanager
@@ -268,30 +279,42 @@ class Database:
                 FROM files ORDER BY timestamp DESC
             ''')
             return cursor.fetchall()
+    
+    def schedule_message_deletion(self, chat_id: int, message_id: int):
+        """Schedule a message for deletion in database"""
+        scheduled_time = datetime.now() + timedelta(seconds=DELETE_AFTER)
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO scheduled_deletions (chat_id, message_id, scheduled_time, delete_after)
+                VALUES (?, ?, ?, ?)
+            ''', (chat_id, message_id, scheduled_time, DELETE_AFTER))
+            conn.commit()
+            log.info(f"Scheduled deletion for message {message_id} in chat {chat_id} at {scheduled_time}")
+    
+    def get_due_messages(self):
+        """Get messages that are due for deletion"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT chat_id, message_id FROM scheduled_deletions 
+                WHERE scheduled_time <= datetime('now')
+            ''')
+            return cursor.fetchall()
+    
+    def remove_scheduled_message(self, chat_id: int, message_id: int):
+        """Remove message from scheduled deletions"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM scheduled_deletions WHERE chat_id = ? AND message_id = ?', 
+                          (chat_id, message_id))
+            conn.commit()
+            log.info(f"Removed scheduled deletion for message {message_id} in chat {chat_id}")
 
 # Initialize database
 db = Database()
 
-# ============ HELPER FUNCTION TO SCHEDULE MESSAGE DELETION ============
-async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
-    """Schedule a message for deletion after DELETE_AFTER seconds"""
-    if not context.job_queue:
-        log.warning(f"Job queue not available - cannot schedule deletion for message {message_id}")
-        return
-    
-    try:
-        # Store chat_id in job.chat_id and message_id in job.data
-        context.job_queue.run_once(
-            delete_message_job,
-            DELETE_AFTER,
-            data=message_id,
-            chat_id=chat_id,
-            name=f"delete_msg_{chat_id}_{message_id}_{int(time.time())}"
-        )
-        log.info(f"Scheduled deletion of message {message_id} from chat {chat_id} in {DELETE_AFTER} seconds")
-    except Exception as e:
-        log.error(f"Failed to schedule deletion for message {message_id}: {e}")
-
+# ============ FIXED MESSAGE DELETION SYSTEM ============
 async def delete_message_job(context):
     """Delete message after timer"""
     try:
@@ -303,24 +326,79 @@ async def delete_message_job(context):
             log.warning(f"Invalid delete job data: chat_id={chat_id}, message_id={message_id}")
             return
         
-        log.info(f"Attempting to delete message {message_id} from chat {chat_id}")
+        log.info(f"🗑️ Attempting to delete message {message_id} from chat {chat_id}")
         
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
             log.info(f"✅ Successfully deleted message {message_id} from chat {chat_id}")
+            # Remove from scheduled deletions database
+            db.remove_scheduled_message(chat_id, message_id)
         except Exception as e:
             error_msg = str(e).lower()
             if "message to delete not found" in error_msg:
                 log.info(f"Message {message_id} already deleted from chat {chat_id}")
+                db.remove_scheduled_message(chat_id, message_id)
             elif "message can't be deleted" in error_msg:
                 log.warning(f"Can't delete message {message_id} - insufficient permissions in chat {chat_id}")
+                # Keep in database to retry later
             elif "chat not found" in error_msg:
                 log.info(f"Chat {chat_id} not found - message probably already deleted")
+                db.remove_scheduled_message(chat_id, message_id)
             else:
                 log.error(f"Failed to delete message {message_id} from chat {chat_id}: {e}")
+                # Keep in database to retry later
                 
     except Exception as e:
         log.error(f"Error in delete_message_job: {e}", exc_info=True)
+
+async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
+    """Schedule a message for deletion after DELETE_AFTER seconds"""
+    try:
+        # Also store in database as backup
+        db.schedule_message_deletion(chat_id, message_id)
+        
+        if not context.job_queue:
+            log.warning(f"Job queue not available - will use database backup for message {message_id}")
+            return
+        
+        # Schedule deletion job
+        context.job_queue.run_once(
+            delete_message_job,
+            DELETE_AFTER,
+            data=message_id,
+            chat_id=chat_id,
+            name=f"delete_msg_{chat_id}_{message_id}_{int(time.time())}"
+        )
+        log.info(f"Scheduled deletion of message {message_id} from chat {chat_id} in {DELETE_AFTER} seconds")
+    except Exception as e:
+        log.error(f"Failed to schedule deletion for message {message_id}: {e}")
+
+async def cleanup_overdue_messages(context: ContextTypes.DEFAULT_TYPE):
+    """Clean up any overdue messages from database"""
+    try:
+        due_messages = db.get_due_messages()
+        if not due_messages:
+            return
+        
+        log.info(f"Found {len(due_messages)} overdue messages to clean up")
+        
+        for chat_id, message_id in due_messages:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+                log.info(f"✅ Cleanup: Deleted overdue message {message_id} from chat {chat_id}")
+                db.remove_scheduled_message(chat_id, message_id)
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "message to delete not found" in error_msg:
+                    log.info(f"Cleanup: Message {message_id} already deleted")
+                    db.remove_scheduled_message(chat_id, message_id)
+                elif "message can't be deleted" in error_msg:
+                    log.warning(f"Cleanup: Can't delete message {message_id} - insufficient permissions")
+                else:
+                    log.error(f"Cleanup: Failed to delete message {message_id}: {e}")
+                    
+    except Exception as e:
+        log.error(f"Error in cleanup_overdue_messages: {e}")
 
 # ============ FIXED MEMBERSHIP CHECK ============
 async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bool = False) -> bool:
@@ -609,11 +687,13 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             days = int(context.args[0])
             days = max(1, min(days, 365))
         except ValueError:
-            await update.message.reply_text("Usage: /cleanup [days=30]\nSet days=0 to cancel")
+            sent_msg = await update.message.reply_text("Usage: /cleanup [days=30]\nSet days=0 to cancel")
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
     
     if days == 0:
-        await update.message.reply_text("✅ Cleanup cancelled. Files will be kept permanently.")
+        sent_msg = await update.message.reply_text("✅ Cleanup cancelled. Files will be kept permanently.")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
     
     try:
@@ -639,7 +719,8 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         
     except Exception as e:
-        await update.message.reply_text(f"❌ Cleanup failed: {str(e)[:100]}")
+        sent_msg = await update.message.reply_text(f"❌ Cleanup failed: {str(e)[:100]}")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def deletefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manually delete a specific file from database"""
@@ -1227,6 +1308,13 @@ def start_bot():
     # Check if job queue is available
     if application.job_queue:
         print("🟢 Job queue initialized")
+        # Add periodic cleanup job (every 5 minutes)
+        application.job_queue.run_repeating(
+            cleanup_overdue_messages,
+            interval=300,  # 5 minutes
+            first=10  # Start after 10 seconds
+        )
+        print("🟢 Periodic message cleanup scheduled")
     else:
         print("⚠️ Job queue not available - auto-delete feature will not work")
 
