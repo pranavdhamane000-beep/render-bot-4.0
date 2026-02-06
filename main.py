@@ -859,9 +859,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             keyboard = []
             if not result["channel1"]:
-                keyboard.append([InlineKeyboardButton(f"📥 Join @{CHANNEL_1}", url=f"https://t.me/{CHANNEL_1}")])
+                keyboard.append([InlineKeyboardButton(f"📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")])
             if not result["channel2"]:
-                keyboard.append([InlineKeyboardButton(f"📥 Join @{CHANNEL_2}", url=f"https://t.me/{CHANNEL_2}")])
+                keyboard.append([InlineKeyboardButton(f"📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")])
             keyboard.append([InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")])
 
             await update.message.reply_text(
@@ -977,9 +977,9 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 keyboard = []
                 if not result["channel1"]:
-                    keyboard.append([InlineKeyboardButton(f"📥 Join @{CHANNEL_1}", url=f"https://t.me/{CHANNEL_1}")])
+                    keyboard.append([InlineKeyboardButton(f"📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")])
                 if not result["channel2"]:
-                    keyboard.append([InlineKeyboardButton(f"📥 Join @{CHANNEL_2}", url=f"https://t.me/{CHANNEL_2}")])
+                    keyboard.append([InlineKeyboardButton(f"📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")])
                 keyboard.append([InlineKeyboardButton("🔄 Check Again", callback_data="check_membership")])
 
                 await query.edit_message_text(
@@ -1025,9 +1025,9 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 keyboard = []
                 if not result['channel1']:
-                    keyboard.append([InlineKeyboardButton(f"📥 Join @{CHANNEL_1}", url=f"https://t.me/{CHANNEL_1}")])
+                    keyboard.append([InlineKeyboardButton(f"📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")])
                 if not result['channel2']:
-                    keyboard.append([InlineKeyboardButton(f"📥 Join @{CHANNEL_2}", url=f"https://t.me/{CHANNEL_2}")])
+                    keyboard.append([InlineKeyboardButton(f"📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")])
                 keyboard.append([InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")])
                 
                 await query.edit_message_text(
