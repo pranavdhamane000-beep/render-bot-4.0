@@ -7,7 +7,7 @@ import time
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 import threading
 import sqlite3
 from contextlib import contextmanager
@@ -42,10 +42,18 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 CHANNEL_1 = os.environ.get("CHANNEL_1", "A_Knight_of_the_Seven_Kingdoms_t").replace("@", "")
 CHANNEL_2 = os.environ.get("CHANNEL_2", "your_movies_web").replace("@", "")
 
-# SQLite database for persistent storage
-DB_PATH = Path("file_bot.db")
+# ============ 🔥 PERSISTENT DISK STORAGE - SURVIVES RESTARTS 🔥 ============
+# Create persistent disk in Render Dashboard first!
+# Mount path: /opt/render/project/src/data
+PERSISTENT_PATH = Path("/opt/render/project/src/data")
+PERSISTENT_PATH.mkdir(parents=True, exist_ok=True)
+
+# SQLite database on persistent disk - FILES WILL NEVER VANISH!
+DB_PATH = PERSISTENT_PATH / "file_bot.db"
+# ===========================================================================
+
 DELETE_AFTER = 600  # 10 minutes - DELETE ALL BOT MESSAGES
-MAX_STORED_FILES = 1000
+MAX_STORED_FILES = 10000  # Increased since we have persistent storage
 AUTO_CLEANUP_DAYS = 0  # Set to 0 to NEVER auto-cleanup files
 
 # Playable formats
@@ -76,6 +84,8 @@ log = logging.getLogger(__name__)
 class Database:
     def __init__(self, db_path: Path = DB_PATH):
         self.db_path = db_path
+        log.info(f"📀 Database path: {self.db_path}")
+        log.info(f"📀 Database exists: {self.db_path.exists()}")
         self.init_db()
     
     def init_db(self):
@@ -103,7 +113,6 @@ class Database:
                     PRIMARY KEY (user_id, channel)
                 )
             ''')
-            # Table to track scheduled deletions
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS scheduled_deletions (
                     chat_id INTEGER NOT NULL,
@@ -113,10 +122,30 @@ class Database:
                     PRIMARY KEY (chat_id, message_id)
                 )
             ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    first_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    last_active DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    total_interactions INTEGER DEFAULT 1,
+                    total_files_accessed INTEGER DEFAULT 0,
+                    last_file_accessed DATETIME
+                )
+            ''')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_cache_timestamp ON membership_cache(timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_deletions_time ON scheduled_deletions(scheduled_time)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_first_seen ON users(first_seen)')
             conn.commit()
+            
+            # Get file count to verify persistence
+            cursor.execute("SELECT COUNT(*) FROM files")
+            file_count = cursor.fetchone()[0]
+            log.info(f"📊 Database initialized with {file_count} existing files")
 
     @contextmanager
     def get_connection(self):
@@ -161,6 +190,7 @@ class Database:
                 )
 
                 conn.commit()
+                log.info(f"💾 Saved file {new_id}: {file_info.get('file_name', '')}")
                 return new_id
 
     def get_file(self, file_id: str) -> Optional[dict]:
@@ -174,7 +204,6 @@ class Database:
             row = cursor.fetchone()
             
             if row:
-                # Increment access count
                 cursor.execute('UPDATE files SET access_count = access_count + 1 WHERE id = ?', (file_id,))
                 conn.commit()
                 
@@ -268,6 +297,8 @@ class Database:
             cursor.execute("DELETE FROM files WHERE id = ?", (file_id,))
             deleted = cursor.rowcount > 0
             conn.commit()
+            if deleted:
+                log.info(f"🗑️ Deleted file {file_id}")
             return deleted
 
     def get_all_files(self) -> list:
@@ -311,6 +342,133 @@ class Database:
             conn.commit()
             log.info(f"Removed scheduled deletion for message {message_id} in chat {chat_id}")
 
+    # ============ USER TRACKING FUNCTIONS ============
+    
+    def update_user_interaction(self, user_id: int, username: str = None, 
+                               first_name: str = None, last_name: str = None,
+                               file_accessed: bool = False):
+        """Update user interaction timestamp and count"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
+            exists = cursor.fetchone()
+            
+            if exists:
+                cursor.execute('''
+                    UPDATE users 
+                    SET last_active = CURRENT_TIMESTAMP,
+                        total_interactions = total_interactions + 1,
+                        username = COALESCE(?, username),
+                        first_name = COALESCE(?, first_name),
+                        last_name = COALESCE(?, last_name)
+                    WHERE user_id = ?
+                ''', (username, first_name, last_name, user_id))
+                
+                if file_accessed:
+                    cursor.execute('''
+                        UPDATE users 
+                        SET total_files_accessed = total_files_accessed + 1,
+                            last_file_accessed = CURRENT_TIMESTAMP
+                        WHERE user_id = ?
+                    ''', (user_id,))
+            else:
+                cursor.execute('''
+                    INSERT INTO users 
+                    (user_id, username, first_name, last_name, first_seen, last_active, total_interactions)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
+                ''', (user_id, username, first_name, last_name))
+            
+            conn.commit()
+    
+    def get_user_stats(self) -> Dict[str, Any]:
+        """Get comprehensive user statistics"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT COUNT(*) FROM users")
+            total_users = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                SELECT COUNT(*) FROM users 
+                WHERE last_active > datetime('now', '-7 days')
+            ''')
+            active_users_7d = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                SELECT COUNT(*) FROM users 
+                WHERE last_active > datetime('now', '-30 days')
+            ''')
+            active_users_30d = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                SELECT COUNT(*) FROM users 
+                WHERE date(first_seen) = date('now')
+            ''')
+            new_users_today = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                SELECT COUNT(*) FROM users 
+                WHERE first_seen > datetime('now', '-7 days')
+            ''')
+            new_users_week = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                SELECT user_id, username, first_name, last_name, 
+                       total_interactions, total_files_accessed,
+                       last_active, first_seen
+                FROM users 
+                ORDER BY total_interactions DESC 
+                LIMIT 10
+            ''')
+            top_users = cursor.fetchall()
+            
+            cursor.execute('''
+                SELECT COUNT(DISTINCT user_id) FROM users 
+                WHERE total_files_accessed > 0
+            ''')
+            users_with_files = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                SELECT 
+                    strftime('%Y-%m-%d', first_seen) as date,
+                    COUNT(*) as new_users
+                FROM users
+                WHERE first_seen > datetime('now', '-30 days')
+                GROUP BY date
+                ORDER BY date DESC
+                LIMIT 15
+            ''')
+            growth_data = cursor.fetchall()
+            
+            return {
+                'total_users': total_users,
+                'active_users_7d': active_users_7d,
+                'active_users_30d': active_users_30d,
+                'new_users_today': new_users_today,
+                'new_users_week': new_users_week,
+                'top_users': top_users,
+                'users_with_files': users_with_files,
+                'growth_data': growth_data
+            }
+    
+    def get_all_user_ids(self, exclude_admin: bool = True) -> List[int]:
+        """Get all user IDs for broadcasting"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            if exclude_admin:
+                cursor.execute("SELECT user_id FROM users WHERE user_id != ?", (ADMIN_ID,))
+            else:
+                cursor.execute("SELECT user_id FROM users")
+            return [row[0] for row in cursor.fetchall()]
+    
+    def get_user_count(self) -> int:
+        """Get total number of users"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM users")
+            return cursor.fetchone()[0]
+
 # Initialize database
 db = Database()
 
@@ -331,7 +489,6 @@ async def delete_message_job(context):
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
             log.info(f"✅ Successfully deleted message {message_id} from chat {chat_id}")
-            # Remove from scheduled deletions database
             db.remove_scheduled_message(chat_id, message_id)
         except Exception as e:
             error_msg = str(e).lower()
@@ -340,13 +497,11 @@ async def delete_message_job(context):
                 db.remove_scheduled_message(chat_id, message_id)
             elif "message can't be deleted" in error_msg:
                 log.warning(f"Can't delete message {message_id} - insufficient permissions in chat {chat_id}")
-                # Keep in database to retry later
             elif "chat not found" in error_msg:
                 log.info(f"Chat {chat_id} not found - message probably already deleted")
                 db.remove_scheduled_message(chat_id, message_id)
             else:
                 log.error(f"Failed to delete message {message_id} from chat {chat_id}: {e}")
-                # Keep in database to retry later
                 
     except Exception as e:
         log.error(f"Error in delete_message_job: {e}", exc_info=True)
@@ -354,14 +509,12 @@ async def delete_message_job(context):
 async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
     """Schedule a message for deletion after DELETE_AFTER seconds"""
     try:
-        # Also store in database as backup
         db.schedule_message_deletion(chat_id, message_id)
         
         if not context.job_queue:
             log.warning(f"Job queue not available - will use database backup for message {message_id}")
             return
         
-        # Schedule deletion job
         context.job_queue.run_once(
             delete_message_job,
             DELETE_AFTER,
@@ -400,13 +553,9 @@ async def cleanup_overdue_messages(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error(f"Error in cleanup_overdue_messages: {e}")
 
-# ============ FIXED MEMBERSHIP CHECK ============
+# ============ MEMBERSHIP CHECK ============
 async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bool = False) -> bool:
-    """
-    Check if user is in channel
-    Returns True if user is member, False if not or can't check
-    """
-    # Check cache first (unless force_check is True)
+    """Check if user is in channel"""
     if not force_check:
         cached = db.get_cached_membership(user_id, channel)
         if cached is not None:
@@ -414,7 +563,6 @@ async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bo
             return cached
     
     try:
-        # Format channel username properly
         if not channel.startswith("@"):
             channel_username = f"@{channel}"
         else:
@@ -422,18 +570,15 @@ async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bo
         
         log.info(f"Checking user {user_id} in {channel_username}")
         
-        # Try to get chat member
         member = await bot.get_chat_member(
             chat_id=channel_username,
             user_id=user_id
         )
         
-        # Check member status
         is_member = member.status in ["member", "administrator", "creator"]
         
         log.info(f"User {user_id} in {channel_username}: status={member.status}, is_member={is_member}")
         
-        # Cache the result
         db.cache_membership(user_id, channel.replace("@", ""), is_member)
         
         return is_member
@@ -442,22 +587,16 @@ async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bo
         error_msg = str(e).lower()
         log.warning(f"Failed to check user {user_id} in @{channel}: {e}")
         
-        # Don't cache failures - let it check fresh next time
-        # Return True to avoid blocking users if there's a temporary issue
-        # But log the error
-        
         if "user not found" in error_msg or "user not participant" in error_msg:
             db.cache_membership(user_id, channel.replace("@", ""), False)
             return False
         elif "chat not found" in error_msg:
             log.error(f"Channel @{channel} not found!")
-            return True  # Assume member if channel not found
+            return True
         elif "forbidden" in error_msg:
-            # Bot can't access the channel
             log.error(f"Bot can't access @{channel}. Might be private or bot not admin.")
-            return True  # Assume member to avoid blocking
+            return True
         else:
-            # For other errors, don't cache and assume True to avoid blocking
             return True
 
 async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, force_check: bool = False) -> Dict[str, Any]:
@@ -471,11 +610,9 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
         "missing_channels": []
     }
     
-    # Clear cache for this user when force checking
     if force_check:
         db.clear_membership_cache(user_id)
     
-    # Check first channel
     try:
         ch1_result = await check_user_in_channel(bot, CHANNEL_1, user_id, force_check)
         result["channel1"] = ch1_result
@@ -483,10 +620,8 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
             result["missing_channels"].append(f"@{CHANNEL_1}")
     except Exception as e:
         log.error(f"Error checking channel 1: {e}")
-        result["channel1"] = True  # Assume true on error to not block
-        # Don't add to missing_channels on error
+        result["channel1"] = True
     
-    # Check second channel
     try:
         ch2_result = await check_user_in_channel(bot, CHANNEL_2, user_id, force_check)
         result["channel2"] = ch2_result
@@ -494,8 +629,7 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
             result["missing_channels"].append(f"@{CHANNEL_2}")
     except Exception as e:
         log.error(f"Error checking channel 2: {e}")
-        result["channel2"] = True  # Assume true on error to not block
-        # Don't add to missing_channels on error
+        result["channel2"] = True
     
     result["all_joined"] = result["channel1"] and result["channel2"]
     
@@ -585,10 +719,11 @@ def home():
         <h1>🤖 Telegram File Bot</h1>
         <div class="status">
             <h3>✅ Status: <strong>ACTIVE</strong></h3>
-            <p>Bot is running on Render</p>
+            <p>Bot is running on Render with Persistent Disk</p>
             <p>Uptime: {{ uptime }}</p>
             <p>Files in DB: {{ file_count }}</p>
-            <p>📁 Storage: PERMANENT (no auto-delete)</p>
+            <p>Users in DB: {{ user_count }}</p>
+            <p>📁 Storage: PERSISTENT DISK (survives restarts)</p>
         </div>
         
         <div class="info">
@@ -596,16 +731,17 @@ def home():
             <ul>
                 <li>Service: <strong>Render Web Service</strong></li>
                 <li>Bot: <strong>@{{ bot_username }}</strong></li>
-                <li>Channels: <strong>@{{ channel1 }}, @{{ channel2 }}</strong></li>
+                <li>Storage: <strong>Persistent Disk - NEVER VANISHES</strong></li>
                 <li>File Storage: <strong>PERMANENT</strong></li>
                 <li>Message Auto-delete: <strong>{{ delete_minutes }} minutes</strong></li>
+                <li>Total Users: <strong>{{ user_count }}</strong></li>
             </ul>
         </div>
         
         <div class="warning">
             <h3>⚠️ Important Notes</h3>
             <ul>
-                <li>Files are stored <strong>PERMANENTLY</strong> in database</li>
+                <li>Files are stored on <strong>PERSISTENT DISK</strong> - survives restarts!</li>
                 <li>Only chat messages auto-delete after {{ delete_minutes }} minutes</li>
                 <li>Users can access same file multiple times forever</li>
                 <li>Admin must manually delete files if needed</li>
@@ -618,7 +754,7 @@ def home():
         </div>
         
         <footer style="margin-top: 20px; border-top: 1px solid rgba(255,255,255,0.2); padding-top: 10px; font-size: 0.8rem;">
-            <small>Render • {{ current_time }} • v1.0 • Permanent Storage</small>
+            <small>Render • {{ current_time }} • v1.1 • Persistent Storage • User Tracking</small>
         </footer>
     </div>
 </body>
@@ -629,8 +765,10 @@ def home():
     uptime_str = str(timedelta(seconds=int(uptime_seconds)))
     
     file_count = 0
+    user_count = 0
     try:
         file_count = db.get_file_count()
+        user_count = db.get_user_count()
     except:
         pass
     
@@ -639,20 +777,28 @@ def home():
                                   uptime=uptime_str,
                                   current_time=datetime.now().strftime("%H:%M:%S"),
                                   file_count=file_count,
+                                  user_count=user_count,
                                   channel1=CHANNEL_1,
                                   channel2=CHANNEL_2,
                                   delete_minutes=DELETE_AFTER//60)
 
 @app.route('/health')
 def health():
+    user_count = 0
+    try:
+        user_count = db.get_user_count()
+    except:
+        pass
+    
     return jsonify({
         "status": "OK", 
         "timestamp": datetime.now().isoformat(),
         "service": "telegram-file-bot",
         "uptime": str(timedelta(seconds=int(time.time() - start_time))),
         "database": "sqlite",
-        "storage": "permanent",
-        "file_count": db.get_file_count()
+        "storage": "persistent_disk",
+        "file_count": db.get_file_count(),
+        "user_count": user_count
     }), 200
 
 @app.route('/ping')
@@ -715,7 +861,6 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"⚠️ Note: Auto-cleanup is DISABLED. Files are kept permanently by default."
         
         sent_msg = await update.message.reply_text(msg)
-        # Schedule this message for deletion too
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         
     except Exception as e:
@@ -733,13 +878,11 @@ async def deletefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Example: /deletefile 123\n\n"
             "Use /listfiles to see all files"
         )
-        # Schedule this message for deletion
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
     
     key = context.args[0]
     
-    # First check if file exists
     file_info = db.get_file(key)
     if not file_info:
         sent_msg = await update.message.reply_text(f"❌ File with key '{key}' not found in database")
@@ -748,7 +891,6 @@ async def deletefile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     filename = file_info.get('file_name', 'Unknown')
     
-    # Delete from database
     if db.delete_file(key):
         sent_msg = await update.message.reply_text(
             f"✅ File deleted from database\n\n"
@@ -778,15 +920,13 @@ async def listfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_access = 0
         message_parts = []
         
-        for i, file in enumerate(files[:50]):  # Show first 50 files
+        for i, file in enumerate(files[:50]):
             file_id, filename, is_video, size, timestamp, access_count = file
             total_size += size if size else 0
             total_access += access_count
             
-            # Format size
             size_mb = size / (1024 * 1024) if size else 0
             
-            # Format date
             try:
                 date_obj = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
                 date_str = date_obj.strftime("%b %d, %Y")
@@ -799,20 +939,18 @@ async def listfiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🎬 {'Video' if is_video else 'Doc'} • {size_mb:.1f}MB • 📅 {date_str} • 👥 {access_count}x\n"
             )
         
-        # Summary
         summary = (
             f"📊 Database Summary:\n"
             f"• Total files: {len(files)}\n"
             f"• Total size: {total_size/(1024*1024*1024):.2f} GB\n"
             f"• Total accesses: {total_access}\n"
-            f"• Storage: PERMANENT (no auto-delete)\n\n"
+            f"• Storage: PERMANENT (persistent disk)\n\n"
             f"📋 Files (showing {min(50, len(files))} of {len(files)}):\n"
         )
         
         full_message = summary + "\n".join(message_parts)
         
         if len(full_message) > 4000:
-            # Split if too long
             sent_msg1 = await update.message.reply_text(full_message[:4000], parse_mode="Markdown")
             sent_msg2 = await update.message.reply_text(full_message[4000:], parse_mode="Markdown")
             await schedule_message_deletion(context, sent_msg1.chat_id, sent_msg1.message_id)
@@ -834,13 +972,13 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uptime_str = str(timedelta(seconds=int(uptime_seconds)))
 
     file_count = db.get_file_count()
+    user_count = db.get_user_count()
     db_size = DB_PATH.stat().st_size / 1024 if DB_PATH.exists() else 0
     
-    # Get total access count
     total_access = 0
     try:
         files = db.get_all_files()
-        total_access = sum(file[5] for file in files)  # access_count is at index 5
+        total_access = sum(file[5] for file in files)
     except:
         pass
 
@@ -849,8 +987,10 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🤖 Bot: @{bot_username}\n"
         f"⏱ Uptime: {uptime_str}\n"
         f"📁 Files in database: {file_count}\n"
+        f"👥 Total users: {user_count}\n"
         f"👥 Total accesses: {total_access}\n"
         f"💾 DB Size: {db_size:.1f} KB\n"
+        f"💿 Storage: Persistent Disk - SURVIVES RESTARTS\n"
         f"🧹 Auto-cleanup: DISABLED (permanent storage)\n"
         f"⏰ Message auto-delete: {DELETE_AFTER//60} minutes\n\n"
         f"📢 Channels:\n"
@@ -859,7 +999,9 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⚙️ Admin commands:\n"
         f"/listfiles - View all files\n"
         f"/deletefile <key> - Delete specific file\n"
-        f"/cleanup [days] - Manual cleanup (optional)"
+        f"/cleanup [days] - Manual cleanup (optional)\n"
+        f"/users - User statistics\n"
+        f"/broadcast - Send message to all users"
     )
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
@@ -894,14 +1036,12 @@ async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     try:
-        # Test channel 1
         try:
             member1 = await context.bot.get_chat_member(f"@{CHANNEL_1}", user_id)
             ch1_status = f"✅ Accessible - Your status: {member1.status}"
         except Exception as e:
             ch1_status = f"❌ Error: {str(e)[:100]}"
         
-        # Test channel 2
         try:
             member2 = await context.bot.get_chat_member(f"@{CHANNEL_2}", user_id)
             ch2_status = f"✅ Accessible - Your status: {member2.status}"
@@ -918,6 +1058,184 @@ async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_msg = await update.message.reply_text(f"❌ Test failed: {e}")
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
+async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show user statistics and top users"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    try:
+        stats_data = db.get_user_stats()
+        
+        top_users_text = ""
+        for i, user in enumerate(stats_data['top_users'], 1):
+            user_id, username, first_name, last_name, interactions, files_accessed, last_active, first_seen = user
+            
+            if first_name and last_name:
+                name = f"{first_name} {last_name}"
+            elif first_name:
+                name = first_name
+            elif username:
+                name = f"@{username}"
+            else:
+                name = f"User {user_id}"
+            
+            try:
+                last_active_dt = datetime.strptime(last_active, "%Y-%m-%d %H:%M:%S")
+                last_active_str = last_active_dt.strftime("%b %d")
+            except:
+                last_active_str = last_active[:10] if last_active else "Unknown"
+            
+            top_users_text += f"{i}. {name[:20]}{'...' if len(name) > 20 else ''}\n"
+            top_users_text += f"   👤 ID: {user_id} | 🔢 {interactions} int | 📁 {files_accessed} files\n"
+            top_users_text += f"   🕐 Last active: {last_active_str}\n"
+        
+        growth_text = ""
+        for date_str, count in stats_data['growth_data'][:7]:
+            growth_text += f"📅 {date_str}: +{count} users\n"
+        
+        message = (
+            f"📊 *USER STATISTICS*\n\n"
+            f"👥 *Total Users:* {stats_data['total_users']}\n"
+            f"🟢 *Active (7 days):* {stats_data['active_users_7d']}\n"
+            f"🟡 *Active (30 days):* {stats_data['active_users_30d']}\n"
+            f"📈 *New Today:* {stats_data['new_users_today']}\n"
+            f"📈 *New This Week:* {stats_data['new_users_week']}\n"
+            f"📁 *Users Who Accessed Files:* {stats_data['users_with_files']}\n\n"
+            f"🏆 *TOP 10 USERS BY INTERACTIONS:*\n{top_users_text}\n"
+            f"📈 *RECENT GROWTH (Last 7 days):*\n{growth_text}\n"
+            f"💡 *Tip:* Use /broadcast to message all users"
+        )
+        
+        sent_msg = await update.message.reply_text(message, parse_mode="Markdown")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        
+    except Exception as e:
+        log.error(f"Error in users command: {e}")
+        sent_msg = await update.message.reply_text(f"❌ Error getting user statistics: {str(e)[:200]}")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Broadcast message to all users"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    if not context.args and not (update.message.reply_to_message and update.message.reply_to_message.text):
+        sent_msg = await update.message.reply_text(
+            "📢 *Broadcast Message to All Users*\n\n"
+            "*Usage:*\n"
+            "1. `/broadcast your message here`\n"
+            "2. Reply to a message with `/broadcast`\n\n"
+            "*Options:*\n"
+            "`/broadcast -silent your message` - Send silently\n"
+            "`/broadcast -test your message` - Test with yourself only",
+            parse_mode="Markdown"
+        )
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        return
+    
+    args = context.args or []
+    silent_mode = False
+    test_mode = False
+    
+    if args and args[0] in ['-silent', '-s']:
+        silent_mode = True
+        args = args[1:]
+    elif args and args[0] in ['-test', '-t']:
+        test_mode = True
+        args = args[1:]
+    
+    if update.message.reply_to_message:
+        if update.message.reply_to_message.text:
+            message_text = update.message.reply_to_message.text
+        elif update.message.reply_to_message.caption:
+            message_text = update.message.reply_to_message.caption
+        else:
+            sent_msg = await update.message.reply_text("❌ Replied message must have text or caption")
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+            return
+    else:
+        message_text = " ".join(args)
+    
+    if not message_text.strip():
+        sent_msg = await update.message.reply_text("❌ Message cannot be empty")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        return
+    
+    if not silent_mode:
+        message_text = f"📢 *Broadcast from @{bot_username}*\n\n{message_text}"
+    
+    if test_mode:
+        user_ids = [update.effective_user.id]
+        sent_msg = await update.message.reply_text("🔄 *TEST MODE:* Sending to yourself only...", parse_mode="Markdown")
+    else:
+        user_ids = db.get_all_user_ids(exclude_admin=True)
+        sent_msg = await update.message.reply_text(
+            f"🔄 *BROADCAST STARTED*\n\n"
+            f"📤 Sending to: {len(user_ids)} users\n"
+            f"📝 Message length: {len(message_text)} chars\n"
+            f"⏳ Please wait...",
+            parse_mode="Markdown"
+        )
+    
+    status_msg = sent_msg
+    total_users = len(user_ids)
+    successful = 0
+    failed = 0
+    blocked = 0
+    
+    for i, user_id in enumerate(user_ids):
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=message_text,
+                parse_mode="Markdown" if not silent_mode else None,
+                disable_notification=silent_mode
+            )
+            successful += 1
+            
+            if (i + 1) % 20 == 0 and not test_mode:
+                try:
+                    await status_msg.edit_text(
+                        f"🔄 *BROADCAST PROGRESS*\n\n"
+                        f"✅ Successful: {successful}\n"
+                        f"❌ Failed: {failed}\n"
+                        f"🚫 Blocked: {blocked}\n"
+                        f"📤 Total: {i+1}/{total_users}\n"
+                        f"⏳ {((i+1)/total_users*100):.1f}% complete",
+                        parse_mode="Markdown"
+                    )
+                except:
+                    pass
+            
+            await asyncio.sleep(0.1)
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "blocked" in error_msg or "forbidden" in error_msg:
+                blocked += 1
+            else:
+                failed += 1
+            log.warning(f"Failed to send broadcast to {user_id}: {e}")
+    
+    report = (
+        f"✅ *BROADCAST COMPLETED*\n\n"
+        f"📊 *Statistics:*\n"
+        f"✅ Successful: {successful}\n"
+        f"❌ Failed: {failed}\n"
+        f"🚫 Blocked/Deleted: {blocked}\n"
+        f"📤 Total Attempted: {total_users}\n\n"
+    )
+    
+    if test_mode:
+        report += f"🔧 *Test Mode:* Only sent to yourself\n"
+    elif silent_mode:
+        report += f"🔕 *Silent Mode:* No notification sound\n"
+    
+    report += f"\n📝 *Message Preview:*\n{message_text[:200]}{'...' if len(message_text) > 200 else ''}"
+    
+    await status_msg.edit_text(report, parse_mode="Markdown")
+    await schedule_message_deletion(context, status_msg.chat_id, status_msg.message_id)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not update.message:
@@ -927,7 +1245,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         args = context.args
 
-        # No file key → show join info
+        user = update.effective_user
+        db.update_user_interaction(
+            user_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name
+        )
+
         if not args:
             keyboard = []
             keyboard.append([InlineKeyboardButton("📢 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")])
@@ -941,15 +1266,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "2️⃣ Join both channels below\n"
                 "3️⃣ Click 'Check Membership' after joining\n\n"
                 f"⚠️ *Note:* All bot messages auto-delete after {DELETE_AFTER//60} minutes\n"
-                "💾 *Storage:* Files are stored permanently in database",
+                "💾 *Storage:* Files are stored permanently on persistent disk",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
-            # Schedule this message for deletion
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
-        # File key exists
         key = args[0]
         file_info = db.get_file(key)
         
@@ -958,32 +1281,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
-        # Check membership (force fresh check for start command)
         result = await check_membership(user_id, context, force_check=True)
         
         if not result["all_joined"]:
-            # Show which channels are missing with better UI - FIXED TO SHOW SINGLE BUTTON
             missing_count = len(result["missing_channels"])
             
-            # Create message with cleaner formatting
             message_text = "🔒 *Access Required*\n\n"
             
             if missing_count == 2:
                 message_text += "⚠️ *You need to join both channels to access this file:*\n"
-                # Create buttons for each channel
                 keyboard = [
                     [InlineKeyboardButton(f"📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
                     [InlineKeyboardButton(f"📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")],
                     [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
                 ]
             elif missing_count == 1:
-                # Only show button for the missing channel
                 missing_channel = result["missing_channels"][0].replace("@", "")
                 channel_name = "Channel 1" if CHANNEL_1 in missing_channel else "Channel 2"
                 
                 message_text += f"⚠️ *You need to join {channel_name} to access this file:*\n"
                 
-                # Create single button for the missing channel
                 keyboard = [
                     [InlineKeyboardButton(f"📥 Join {channel_name}", url=f"https://t.me/{missing_channel}")],
                     [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
@@ -996,22 +1313,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
-            # Schedule this message for deletion
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
-        # User has joined both channels - send the file
+        db.update_user_interaction(user_id=user_id, file_accessed=True)
+        
         try:
             filename = file_info['file_name']
             ext = filename.lower().split('.')[-1] if '.' in filename else ""
             
-            # Add warning message to caption
             warning_msg = f"\n\n⚠️ *This message will auto-delete in {DELETE_AFTER//60} minutes*\n"
             warning_msg += f"📤 *Forward to saved messages to keep it*\n"
-            warning_msg += f"💾 *File is stored permanently in database*"
+            warning_msg += f"💾 *File is stored permanently on persistent disk*"
             
             if file_info['is_video'] and ext in PLAYABLE_EXTS:
-                # Send as playable video
                 sent = await context.bot.send_video(
                     chat_id=chat_id,
                     video=file_info["file_id"],
@@ -1020,7 +1335,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     supports_streaming=True
                 )
             else:
-                # Send as document
                 sent = await context.bot.send_document(
                     chat_id=chat_id,
                     document=file_info["file_id"],
@@ -1028,13 +1342,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown"
                 )
             
-            # Schedule deletion of the MESSAGE (not file from database)
             await schedule_message_deletion(context, sent.chat_id, sent.message_id)
                 
         except Exception as e:
             log.error(f"Error sending file: {e}", exc_info=True)
             
-            # More specific error messages
             error_msg = str(e).lower()
             
             if "file is too big" in error_msg or "too large" in error_msg:
@@ -1046,10 +1358,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 sent_msg = await update.message.reply_text("❌ Failed to send file. Please try again.")
             
-            # Schedule error message for deletion
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-            
-            # Log detailed error
             log.error(f"File send failed for {key}: {traceback.format_exc()}")
 
     except Exception as e:
@@ -1069,7 +1378,14 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = query.from_user.id
         data = query.data
         
-        # Handle membership check without file
+        user = query.from_user
+        db.update_user_interaction(
+            user_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name
+        )
+        
         if data == "check_membership":
             result = await check_membership(user_id, context, force_check=True)
             
@@ -1078,7 +1394,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"✅ *Great! You've joined both channels!*\n\n"
                     "Now you can use file links shared by the admin.\n"
                     f"⚠️ *Note:* All bot messages auto-delete after {DELETE_AFTER//60} minutes\n"
-                    "💾 *Storage:* Files are stored permanently in database",
+                    "💾 *Storage:* Files are stored permanently on persistent disk",
                     parse_mode="Markdown"
                 )
             else:
@@ -1087,20 +1403,17 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 if missing_count == 2:
                     message_text += "You're not a member of either channel.\n"
-                    # Create buttons for each channel
                     keyboard = [
                         [InlineKeyboardButton(f"📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
                         [InlineKeyboardButton(f"📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")],
                         [InlineKeyboardButton("🔄 Check Again", callback_data="check_membership")]
                     ]
                 elif missing_count == 1:
-                    # Only show button for the missing channel
                     missing_channel = result["missing_channels"][0].replace("@", "")
                     channel_name = "Channel 1" if CHANNEL_1 in missing_channel else "Channel 2"
                     
                     message_text += f"You're missing {channel_name}.\n"
                     
-                    # Create single button for the missing channel
                     keyboard = [
                         [InlineKeyboardButton(f"📥 Join {channel_name}", url=f"https://t.me/{missing_channel}")],
                         [InlineKeyboardButton("🔄 Check Again", callback_data="check_membership")]
@@ -1115,7 +1428,6 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
         
-        # Handle file access check
         if data.startswith("check|"):
             data_parts = data.split("|")
             if len(data_parts) != 2:
@@ -1123,7 +1435,6 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             _, key = data_parts
             
-            # Check if file exists in database
             try:
                 file_info = db.get_file(key)
                 if not file_info:
@@ -1134,30 +1445,25 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("❌ Error accessing file. Please try again.")
                 return
             
-            # Check membership with force check (clear cache)
             result = await check_membership(user_id, context, force_check=True)
             
             if not result['all_joined']:
-                # Update message with cleaner UI
                 text = "❌ *Still Not Joined*\n\n"
                 missing_count = len(result["missing_channels"])
                 
                 if missing_count == 2:
                     text += "You need to join both channels:\n"
-                    # Create buttons for each channel
                     keyboard = [
                         [InlineKeyboardButton(f"📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
                         [InlineKeyboardButton(f"📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")],
                         [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
                     ]
                 elif missing_count == 1:
-                    # Only show button for the missing channel
                     missing_channel = result["missing_channels"][0].replace("@", "")
                     channel_name = "Channel 1" if CHANNEL_1 in missing_channel else "Channel 2"
                     
                     text += f"You need to join {channel_name}:\n"
                     
-                    # Create single button for the missing channel
                     keyboard = [
                         [InlineKeyboardButton(f"📥 Join {channel_name}", url=f"https://t.me/{missing_channel}")],
                         [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
@@ -1172,15 +1478,15 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             
-            # User has joined both channels - send the file
+            db.update_user_interaction(user_id=user_id, file_accessed=True)
+            
             try:
                 filename = file_info.get('file_name', 'file')
                 ext = filename.lower().split('.')[-1] if '.' in filename else ""
                 
-                # Add warning message to caption
                 warning_msg = f"\n\n⚠️ *This message will auto-delete in {DELETE_AFTER//60} minutes*\n"
                 warning_msg += f"📤 *Forward to saved messages to keep it*\n"
-                warning_msg += f"💾 *File is stored permanently in database*"
+                warning_msg += f"💾 *File is stored permanently on persistent disk*"
                 
                 chat_id = query.message.chat_id
                 
@@ -1202,12 +1508,10 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 await query.edit_message_text("✅ *Access granted! File sent below.*", parse_mode="Markdown")
                 
-                # Schedule deletion of the FILE MESSAGE
                 await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
                 
             except Exception as e:
                 log.error(f"Failed to send file in callback: {e}", exc_info=True)
-                # More specific error messages
                 error_msg = str(e).lower()
                 
                 if "file is too big" in error_msg or "too large" in error_msg:
@@ -1262,7 +1566,6 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
-        # Save to database
         file_info = {
             "file_name": filename,
             "mime_type": mime_type,
@@ -1280,12 +1583,11 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📦 *Size:* {file_size/1024/1024:.1f} MB\n"
             f"🔑 *Key:* `{key}`\n"
             f"⏰ *Message auto-delete:* {DELETE_AFTER//60} minutes\n"
-            f"💾 *Storage:* PERMANENT in database\n\n"
+            f"💾 *Storage:* PERMANENT on persistent disk\n\n"
             f"🔗 *Link:*\n`{link}`\n\n"
             f"⚠️ *Note:* File will be stored FOREVER unless manually deleted",
             parse_mode="Markdown"
         )
-        # Schedule this upload confirmation message for deletion
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
     except Exception as e:
@@ -1302,23 +1604,19 @@ def start_bot():
         print("❌ ERROR: ADMIN_ID is not set or invalid!")
         return
     
-    # Initialize application with job queue
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Check if job queue is available
     if application.job_queue:
         print("🟢 Job queue initialized")
-        # Add periodic cleanup job (every 5 minutes)
         application.job_queue.run_repeating(
             cleanup_overdue_messages,
-            interval=300,  # 5 minutes
-            first=10  # Start after 10 seconds
+            interval=300,
+            first=10
         )
         print("🟢 Periodic message cleanup scheduled")
     else:
         print("⚠️ Job queue not available - auto-delete feature will not work")
 
-    # Add handlers
     application.add_error_handler(error_handler)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("cleanup", cleanup))
@@ -1327,8 +1625,9 @@ def start_bot():
     application.add_handler(CommandHandler("testchannel", testchannel))
     application.add_handler(CommandHandler("listfiles", listfiles))
     application.add_handler(CommandHandler("deletefile", deletefile))
+    application.add_handler(CommandHandler("users", users))
+    application.add_handler(CommandHandler("broadcast", broadcast))
     
-    # Add callback query handlers
     application.add_handler(CallbackQueryHandler(check_join, pattern=r"^check_membership$"))
     application.add_handler(CallbackQueryHandler(check_join, pattern=r"^check\|"))
 
@@ -1337,31 +1636,27 @@ def start_bot():
         MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload)
     )
 
-    print("🟢 Bot is running and listening...")
+    print("\n" + "=" * 60)
+    print("🤖 TELEGRAM FILE BOT - PERSISTENT DISK STORAGE")
+    print("=" * 60)
     print(f"🟢 Bot username: @{bot_username}")
     print(f"🟢 Admin ID: {ADMIN_ID}")
     print(f"🟢 Channels: @{CHANNEL_1}, @{CHANNEL_2}")
-    print(f"🟢 ALL bot messages auto-delete after: {DELETE_AFTER//60} minutes")
-    print(f"🟢 Database auto-cleanup: DISABLED (files stored permanently)")
-    print(f"🟢 Max stored files: {MAX_STORED_FILES}")
-    print("\n⚠️ IMPORTANT: Files are stored PERMANENTLY in database!")
-    print("   Use /listfiles to see all files")
-    print("   Use /deletefile <key> to delete specific files")
-    print("   Use /cleanup [days] for manual cleanup (optional)")
-    print("\n⚠️ Channels must be PUBLIC for membership check!")
-    print("   Use /testchannel to test channel access")
-    print("   Use /clearcache to clear membership cache")
+    print(f"🟢 Message auto-delete: {DELETE_AFTER//60} minutes")
+    print(f"🟢 Database path: {DB_PATH}")
+    print(f"🟢 Database exists: {DB_PATH.exists()}")
+    print(f"🟢 Storage: PERSISTENT DISK - SURVIVES RESTARTS!")
+    print("=" * 60)
     
-    # Clear cache on startup
-    db.clear_membership_cache()
-    
-    # Log storage info
     try:
         file_count = db.get_file_count()
-        print(f"🟢 Database initialized. Files in database: {file_count}")
-        print(f"🟢 Files will be kept FOREVER in database")
+        user_count = db.get_user_count()
+        print(f"📊 Files in database: {file_count}")
+        print(f"👥 Users in database: {user_count}")
     except Exception as e:
-        print(f"⚠️ Database initialization failed: {e}")
+        print(f"⚠️ Database check failed: {e}")
+    
+    db.clear_membership_cache()
     
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
@@ -1369,37 +1664,22 @@ def start_bot():
     )
 
 def main():
-    print("\n" + "=" * 50)
-    print("🤖 TELEGRAM FILE BOT - PERMANENT STORAGE")
-    print("=" * 50)
-
     if not BOT_TOKEN:
         print("❌ ERROR: BOT_TOKEN is not set!")
-        print("💡 Set it as environment variable or in .env file")
         return
 
     if not ADMIN_ID or ADMIN_ID == 0:
         print("❌ ERROR: ADMIN_ID is not set or invalid!")
-        print("💡 Get your Telegram ID from @userinfobot")
         return
 
-    print(f"🟢 Admin ID: {ADMIN_ID}")
-    print(f"🟢 Channels: @{CHANNEL_1}, @{CHANNEL_2}")
-    print(f"🟢 ALL bot messages auto-delete after: {DELETE_AFTER//60} minutes")
-    print(f"🟢 Database storage: PERMANENT (no auto-cleanup)")
-    print(f"🟢 Max files: {MAX_STORED_FILES}")
-    print("\n⚠️ FILES WILL BE STORED FOREVER IN DATABASE!")
-    print("   Use /deletefile or /cleanup to manually remove files")
-    
-    # Start Flask
     print("\n🟢 Starting Flask web dashboard...")
     flask_thread = threading.Thread(target=run_flask_thread, daemon=True)
     flask_thread.start()
     time.sleep(1)
     print(f"🟢 Flask running on port {os.environ.get('PORT', 10000)}")
 
-    # Start bot
     start_bot()
 
 if __name__ == "__main__":
     main()
+
