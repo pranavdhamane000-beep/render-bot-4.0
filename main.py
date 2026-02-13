@@ -1363,7 +1363,8 @@ async def run_bot():
     """Run the bot"""
     try:
         # Initialize database
-        await db.get_connection()
+       await asyncio.to_thread(db.get_connection)
+
         
         # Create application
         application = Application.builder().token(BOT_TOKEN).build()
