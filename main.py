@@ -10,12 +10,15 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 import threading
 import pg8000
-import ssl  # Added for SSL context
+import ssl
 from contextlib import asynccontextmanager
 import urllib.parse
 
+db_lock = asyncio.Lock()
+
 # ================= HEALTH SERVER FOR RENDER =================
 from flask import Flask, render_template_string, jsonify
+
 app = Flask(__name__)
 
 # Global variables for web dashboard
@@ -61,9 +64,6 @@ ALL_VIDEO_EXTS = {
     "mp4", "mkv", "mov", "avi", "webm", "flv", "m4v", 
     "3gp", "wmv", "mpg", "mpeg"
 }
-
-# Broadcast limit
-BROADCAST_LIMIT = 5000  # Increased to 5000 as requested
 
 # =========================================
 
@@ -259,22 +259,23 @@ class Database:
     
     async def save_file(self, file_id: str, file_info: dict) -> str:
         """Save file info and return generated ID"""
-        result = await self.fetchrow('''
-            INSERT INTO files
-            (file_id, file_name, mime_type, is_video, file_size, access_count)
-            VALUES (%s, %s, %s, %s, %s, 0)
-            RETURNING id
-        ''', (
-            file_id,
-            file_info.get('file_name', ''),
-            file_info.get('mime_type', ''),
-            1 if file_info.get('is_video', False) else 0,
-            file_info.get('size', 0)
-        ))
-        await self.get_connection().commit()
-        new_id = str(result[0])
-        log.info(f"💾 Saved file {new_id}: {file_info.get('file_name', '')}")
-        return new_id
+        async with db_lock:
+            result = await self.fetchrow('''
+                INSERT INTO files
+                (file_id, file_name, mime_type, is_video, file_size, access_count)
+                VALUES ($1, $2, $3, $4, $5, 0)
+                RETURNING id
+            ''', (
+                file_id,
+                file_info.get('file_name', ''),
+                file_info.get('mime_type', ''),
+                1 if file_info.get('is_video', False) else 0,
+                file_info.get('size', 0)
+            ))
+            await self.get_connection().commit()
+            new_id = str(result[0])
+            log.info(f"💾 Saved file {new_id}: {file_info.get('file_name', '')}")
+            return new_id
 
     async def get_file(self, file_id: str) -> Optional[dict]:
         """Get file info by ID"""
@@ -287,7 +288,7 @@ class Database:
         result = await self.fetchrow('''
             UPDATE files
             SET access_count = access_count + 1
-            WHERE id = %s
+            WHERE id = $1
             RETURNING file_id, file_name, mime_type, is_video, file_size, 
                       TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS') as timestamp, 
                       access_count
@@ -315,7 +316,7 @@ class Database:
         """Cache membership check result"""
         await self.execute_and_commit('''
             INSERT INTO membership_cache (user_id, channel, is_member, timestamp)
-            VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+            VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
             ON CONFLICT (user_id, channel) DO UPDATE
             SET is_member = EXCLUDED.is_member,
                 timestamp = EXCLUDED.timestamp
@@ -325,7 +326,7 @@ class Database:
         """Get cached membership result (valid for 5 minutes)"""
         result = await self.fetchrow('''
             SELECT is_member FROM membership_cache 
-            WHERE user_id = %s AND channel = %s 
+            WHERE user_id = $1 AND channel = $2 
             AND timestamp > CURRENT_TIMESTAMP - INTERVAL '5 minutes'
         ''', (user_id, channel))
         return bool(result[0]) if result else None
@@ -333,7 +334,7 @@ class Database:
     async def clear_membership_cache(self, user_id: Optional[int] = None):
         """Clear membership cache for a user or all users"""
         if user_id:
-            await self.execute_and_commit("DELETE FROM membership_cache WHERE user_id = %s", (user_id,))
+            await self.execute_and_commit("DELETE FROM membership_cache WHERE user_id = $1", (user_id,))
             log.info(f"Cleared cache for user {user_id}")
         else:
             await self.execute_and_commit("DELETE FROM membership_cache")
@@ -346,7 +347,7 @@ class Database:
         except ValueError:
             return False
         
-        rowcount = await self.execute_and_commit("DELETE FROM files WHERE id = %s", (file_id_int,))
+        rowcount = await self.execute_and_commit("DELETE FROM files WHERE id = $1", (file_id_int,))
         deleted = rowcount > 0
         if deleted:
             log.info(f"🗑️ Deleted file {file_id}")
@@ -368,7 +369,7 @@ class Database:
         scheduled_time = datetime.now() + timedelta(seconds=DELETE_AFTER)
         await self.execute_and_commit('''
             INSERT INTO scheduled_deletions (chat_id, message_id, scheduled_time, delete_after)
-            VALUES (%s, %s, %s, %s)
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT (chat_id, message_id) DO UPDATE
             SET scheduled_time = EXCLUDED.scheduled_time,
                 delete_after = EXCLUDED.delete_after
@@ -386,7 +387,7 @@ class Database:
     async def remove_scheduled_message(self, chat_id: int, message_id: int):
         """Remove message from scheduled deletions"""
         await self.execute_and_commit(
-            'DELETE FROM scheduled_deletions WHERE chat_id = %s AND message_id = %s',
+            'DELETE FROM scheduled_deletions WHERE chat_id = $1 AND message_id = $2',
             (chat_id, message_id)
         )
         log.info(f"Removed scheduled deletion for message {message_id}")
@@ -397,35 +398,36 @@ class Database:
                                     first_name: str = None, last_name: str = None,
                                     file_accessed: bool = False):
         """Update user interaction timestamp and count"""
-        # Check if user exists
-        exists = await self.fetchrow("SELECT 1 FROM users WHERE user_id = %s", (user_id,))
-        
-        if exists:
-            # Update existing user
-            await self.execute_and_commit('''
-                UPDATE users 
-                SET last_active = CURRENT_TIMESTAMP,
-                    total_interactions = total_interactions + 1,
-                    username = COALESCE(%s, username),
-                    first_name = COALESCE(%s, first_name),
-                    last_name = COALESCE(%s, last_name)
-                WHERE user_id = %s
-            ''', (username, first_name, last_name, user_id))
+        async with self.connection_lock:
+            # Check if user exists
+            exists = await self.fetchrow("SELECT 1 FROM users WHERE user_id = $1", (user_id,))
             
-            if file_accessed:
+            if exists:
+                # Update existing user
                 await self.execute_and_commit('''
                     UPDATE users 
-                    SET total_files_accessed = total_files_accessed + 1,
-                        last_file_accessed = CURRENT_TIMESTAMP
-                    WHERE user_id = %s
-                ''', (user_id,))
-        else:
-            # Insert new user
-            await self.execute_and_commit('''
-                INSERT INTO users 
-                (user_id, username, first_name, last_name, first_seen, last_active, total_interactions)
-                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
-            ''', (user_id, username, first_name, last_name))
+                    SET last_active = CURRENT_TIMESTAMP,
+                        total_interactions = total_interactions + 1,
+                        username = COALESCE($1, username),
+                        first_name = COALESCE($2, first_name),
+                        last_name = COALESCE($3, last_name)
+                    WHERE user_id = $4
+                ''', (username, first_name, last_name, user_id))
+                
+                if file_accessed:
+                    await self.execute_and_commit('''
+                        UPDATE users 
+                        SET total_files_accessed = total_files_accessed + 1,
+                            last_file_accessed = CURRENT_TIMESTAMP
+                        WHERE user_id = $1
+                    ''', (user_id,))
+            else:
+                # Insert new user
+                await self.execute_and_commit('''
+                    INSERT INTO users 
+                    (user_id, username, first_name, last_name, first_seen, last_active, total_interactions)
+                    VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
+                ''', (user_id, username, first_name, last_name))
     
     async def get_user_stats(self) -> Dict[str, Any]:
         """Get comprehensive user statistics"""
@@ -509,7 +511,7 @@ class Database:
     async def get_all_user_ids(self, exclude_admin: bool = True) -> List[int]:
         """Get all user IDs for broadcasting"""
         if exclude_admin:
-            rows = await self.fetchall("SELECT user_id FROM users WHERE user_id != %s", (ADMIN_ID,))
+            rows = await self.fetchall("SELECT user_id FROM users WHERE user_id != $1", (ADMIN_ID,))
         else:
             rows = await self.fetchall("SELECT user_id FROM users")
         return [row[0] for row in rows]
@@ -752,7 +754,6 @@ def home():
                 <li>Database: <strong>Render PostgreSQL</strong></li>
                 <li>Storage: <strong>PERMANENT - Survives restarts!</strong></li>
                 <li>Message Auto-delete: <strong>{{ delete_minutes }} minutes</strong></li>
-                <li>Broadcast Limit: <strong>5000 users</strong></li>
             </ul>
         </div>
         
@@ -811,19 +812,17 @@ def health():
         "database": "postgresql",
         "storage": "permanent",
         "file_count": file_count,
-        "user_count": user_count,
-        "broadcast_limit": BROADCAST_LIMIT
+        "user_count": user_count
     }), 200
 
 @app.route('/ping')
 def ping():
     return "pong", 200
 
-def run_flask():
-    """Run Flask server"""
+def run_flask_thread():
+    """Run Flask server in a thread"""
     port = int(os.environ.get('PORT', 10000))
     
-    # Suppress Flask logs
     import warnings
     warnings.filterwarnings("ignore")
     
@@ -831,7 +830,6 @@ def run_flask():
     flask_logging.getLogger('werkzeug').setLevel(flask_logging.ERROR)
     flask_logging.getLogger('flask').setLevel(flask_logging.ERROR)
     
-    log.info(f"🌐 Flask server starting on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False, threaded=True)
 
 # ============ COMMAND HANDLERS ============
@@ -873,7 +871,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "2️⃣ Join both channels\n"
                 "3️⃣ Click 'Check Membership'\n\n"
                 f"⚠️ Messages auto-delete after {DELETE_AFTER//60} minutes\n"
-                f"📢 Broadcast limit: {BROADCAST_LIMIT} users\n"
                 "💾 *Storage:* PERMANENT PostgreSQL",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
@@ -1161,8 +1158,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👥 Users: {user_count}\n"
         f"👀 Accesses: {total_access}\n"
         f"💾 Database: PostgreSQL (permanent)\n"
-        f"⏰ Auto-delete: {DELETE_AFTER//60} minutes\n"
-        f"📢 Broadcast Limit: {BROADCAST_LIMIT} users",
+        f"⏰ Auto-delete: {DELETE_AFTER//60} minutes",
         parse_mode="Markdown"
     )
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
@@ -1220,7 +1216,6 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🟡 Active (30d): {stats_data['active_users_30d']}\n"
         f"📈 New Today: {stats_data['new_users_today']}\n"
         f"📁 File Accessors: {stats_data['users_with_files']}\n"
-        f"📢 Broadcast Limit: {BROADCAST_LIMIT}"
     )
     
     sent_msg = await update.message.reply_text(msg, parse_mode="Markdown")
@@ -1250,20 +1245,15 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Get all users
     user_ids = await db.get_all_user_ids(exclude_admin=True)
     
-    # Apply broadcast limit (now 5000)
-    total_users = len(user_ids)
-    users_to_send = user_ids[:BROADCAST_LIMIT]
-    
     status_msg = await update.message.reply_text(
-        f"🔄 Broadcasting to {len(users_to_send)} users...",
+        f"🔄 Broadcasting to {len(user_ids)} users...",
         parse_mode="Markdown"
     )
     
     successful = 0
     failed = 0
     
-    # Send to users
-    for user_id in users_to_send:
+    for user_id in user_ids[:100]:  # Limit to 100 for free tier
         try:
             await context.bot.send_message(
                 chat_id=user_id,
@@ -1271,28 +1261,15 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             successful += 1
-            await asyncio.sleep(0.05)  # Small delay to avoid hitting rate limits
+            await asyncio.sleep(0.05)
         except Exception as e:
             failed += 1
             log.warning(f"Failed to send to {user_id}: {e}")
     
-    # Report results
-    if total_users > BROADCAST_LIMIT:
-        remaining = total_users - BROADCAST_LIMIT
-        result_text = (
-            f"✅ Broadcast partial complete\n"
-            f"✅ Sent: {successful}\n"
-            f"❌ Failed: {failed}\n"
-            f"⚠️ {remaining} users not processed (limit: {BROADCAST_LIMIT})"
-        )
-    else:
-        result_text = (
-            f"✅ Broadcast complete\n"
-            f"✅ Sent: {successful}\n"
-            f"❌ Failed: {failed}"
-        )
-    
-    await status_msg.edit_text(result_text, parse_mode="Markdown")
+    await status_msg.edit_text(
+        f"✅ Broadcast complete\n✅ Sent: {successful}\n❌ Failed: {failed}",
+        parse_mode="Markdown"
+    )
     await schedule_message_deletion(context, status_msg.chat_id, status_msg.message_id)
 
 async def clearcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1343,10 +1320,9 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
     
-    # ✅ FIXED: Added await and use db instead of self
     result = await db.execute_and_commit('''
         DELETE FROM files 
-        WHERE timestamp < CURRENT_TIMESTAMP - INTERVAL '1 day' * %s
+        WHERE timestamp < CURRENT_TIMESTAMP - INTERVAL '1 day' * $1
     ''', (days,))
     
     file_count = await db.get_file_count()
@@ -1358,67 +1334,55 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
-# ============ MAIN BOT FUNCTION ============
-async def run_bot():
-    """Run the bot"""
-    try:
-        # Initialize database
-       await asyncio.to_thread(db.get_connection)
-
-        
-        # Create application
-        application = Application.builder().token(BOT_TOKEN).build()
-        
-        # Add job queue for cleanup
-        if application.job_queue:
-            application.job_queue.run_repeating(
-                cleanup_overdue_messages,
-                interval=300,
-                first=10
-            )
-        
-        # Add handlers
-        application.add_error_handler(error_handler)
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("stats", stats))
-        application.add_handler(CommandHandler("listfiles", listfiles))
-        application.add_handler(CommandHandler("deletefile", deletefile))
-        application.add_handler(CommandHandler("users", users))
-        application.add_handler(CommandHandler("broadcast", broadcast))
-        application.add_handler(CommandHandler("clearcache", clearcache))
-        application.add_handler(CommandHandler("testchannel", testchannel))
-        application.add_handler(CommandHandler("cleanup", cleanup))
-        
-        # Add callback query handlers
-        application.add_handler(CallbackQueryHandler(check_join, pattern="^check_membership$"))
-        application.add_handler(CallbackQueryHandler(check_join, pattern="^check\\|"))
-        
-        # Add upload handler for admin
-        upload_filter = filters.VIDEO | filters.Document.ALL
-        application.add_handler(
-            MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload)
-        )
-        
-        log.info("🤖 Bot started successfully")
-        log.info(f"📁 Files in database: {await db.get_file_count()}")
-        log.info(f"👥 Users in database: {await db.get_user_count()}")
-        log.info(f"📢 Broadcast limit: {BROADCAST_LIMIT} users")
-        log.info("🤖 Bot starting polling...")
-        
-        
-        await application.run_polling(allowed_updates=Update.ALL_TYPES)
+# ============ MAIN ============
+async def start_bot():
+    """Start the bot"""
+    if not BOT_TOKEN or not ADMIN_ID:
+        log.error("Missing BOT_TOKEN or ADMIN_ID")
+        return
     
+    # Initialize database
+    await db.get_connection()
+    
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add job queue for cleanup
+    if application.job_queue:
+        application.job_queue.run_repeating(
+            cleanup_overdue_messages,
+            interval=300,
+            first=10
+        )
+    
+    # Add handlers
+    application.add_error_handler(error_handler)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(CommandHandler("listfiles", listfiles))
+    application.add_handler(CommandHandler("deletefile", deletefile))
+    application.add_handler(CommandHandler("users", users))
+    application.add_handler(CommandHandler("broadcast", broadcast))
+    application.add_handler(CommandHandler("clearcache", clearcache))
+    application.add_handler(CommandHandler("testchannel", testchannel))
+    application.add_handler(CommandHandler("cleanup", cleanup))
+    
+    application.add_handler(CallbackQueryHandler(check_join, pattern="^check_membership$"))
+    application.add_handler(CallbackQueryHandler(check_join, pattern="^check\\|"))
+    
+    upload_filter = filters.VIDEO | filters.Document.ALL
+    application.add_handler(
+        MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload)
+    )
+    
+    log.info("🤖 Bot started successfully")
+    log.info(f"📁 Files in database: {await db.get_file_count()}")
+    log.info(f"👥 Users in database: {await db.get_user_count()}")
+    
+    await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-        
-    except Exception as e:
-        log.error(f"Fatal error in bot: {e}", exc_info=True)
-        raise
-    finally:
-        await db.close()
-
-# ============ ENTRY POINT ============
 def main():
-    """Main function - ENTRY POINT"""
+    """Main function"""
     print("\n" + "=" * 60)
     print("🤖 TELEGRAM FILE BOT - RENDER POSTGRESQL + pg8000")
     print("=" * 60)
@@ -1426,28 +1390,24 @@ def main():
     print(f"✅ Admin: {ADMIN_ID}")
     print(f"✅ Database: Render PostgreSQL (PERMANENT)")
     print(f"✅ Driver: pg8000 (Pure Python, No Compilation)")
-    print(f"✅ Broadcast Limit: {BROADCAST_LIMIT} users")
     print("=" * 60 + "\n")
     
-    # Start Flask in background thread
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    # Start Flask
+    flask_thread = threading.Thread(target=run_flask_thread, daemon=True)
     flask_thread.start()
-    log.info("🌐 Flask web server thread started")
     
-    # Start bot (FIXED)
+    # Start bot
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(run_bot())   # ✅ FIXED NAME
+        asyncio.run(start_bot())
     except KeyboardInterrupt:
-        print("\n🛑 Bot stopped by user")
+        print("\n🛑 Bot stopped")
     except Exception as e:
         log.error(f"Fatal error: {e}", exc_info=True)
     finally:
-        print("👋 Bot shutdown complete")
-
+        try:
+            asyncio.run(db.close())
+        except:
+            pass
 
 if __name__ == "__main__":
     main()
-
-
