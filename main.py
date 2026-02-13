@@ -1363,20 +1363,21 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ MAIN ============
 async def start_bot():
     """Start the bot"""
+
     if not BOT_TOKEN or not ADMIN_ID:
         log.error("Missing BOT_TOKEN or ADMIN_ID")
         return
-    
-    # Initialize database (this now completes properly)
+
+    # Initialize database
     log.info("📀 Initializing database connection...")
     await db.get_connection()
     log.info("✅ Database connection initialized successfully")
-    
+
     # Create application
     log.info("🤖 Creating bot application...")
     application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Add job queue for cleanup
+
+    # Setup cleanup job
     if application.job_queue:
         log.info("⏰ Setting up cleanup job...")
         application.job_queue.run_repeating(
@@ -1384,7 +1385,7 @@ async def start_bot():
             interval=300,
             first=10
         )
-    
+
     # Add handlers
     log.info("📝 Adding command handlers...")
     application.add_error_handler(error_handler)
@@ -1397,19 +1398,26 @@ async def start_bot():
     application.add_handler(CommandHandler("clearcache", clearcache))
     application.add_handler(CommandHandler("testchannel", testchannel))
     application.add_handler(CommandHandler("cleanup", cleanup))
-    
-    application.add_handler(CallbackQueryHandler(check_join, pattern="^check_membership$"))
-    application.add_handler(CallbackQueryHandler(check_join, pattern="^check\\|"))
-    
+
+    application.add_handler(
+        CallbackQueryHandler(check_join, pattern="^check_membership$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(check_join, pattern="^check\\|")
+    )
+
     upload_filter = filters.VIDEO | filters.Document.ALL
     application.add_handler(
-        MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload)
+        MessageHandler(
+            upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE,
+            upload
+        )
     )
-    
-    # Get counts for startup message
+
+    # Startup stats
     file_count = await db.get_file_count()
     user_count = await db.get_user_count()
-    
+
     log.info("=" * 50)
     log.info("🤖 BOT STARTED SUCCESSFULLY! 🎉")
     log.info("=" * 50)
@@ -1418,20 +1426,16 @@ async def start_bot():
     log.info(f"⏱️  Auto-delete: {DELETE_AFTER//60} minutes")
     log.info(f"💾 Storage: PERMANENT PostgreSQL")
     log.info("=" * 50)
-    
+
+    # Remove webhook (important for Render polling)
+    log.info("🔗 Removing webhook...")
+    await application.bot.delete_webhook(drop_pending_updates=True)
+
     # Start polling
-   
-log.info("📡 Initializing application...")
-await application.initialize()
+    log.info("📡 Starting polling...")
+    await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-log.info("🔗 Removing webhook...")
-await application.bot.delete_webhook(drop_pending_updates=True)
 
-log.info("🚀 Starting application...")
-await application.start()
-
-log.info("📡 Polling started successfully!")
-await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 def main():
