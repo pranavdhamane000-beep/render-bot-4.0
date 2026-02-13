@@ -1368,16 +1368,13 @@ async def start_bot():
         log.error("Missing BOT_TOKEN or ADMIN_ID")
         return
 
-    # Initialize database
     log.info("📀 Initializing database connection...")
     await db.get_connection()
     log.info("✅ Database connection initialized successfully")
 
-    # Create application
     log.info("🤖 Creating bot application...")
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Setup cleanup job
     if application.job_queue:
         log.info("⏰ Setting up cleanup job...")
         application.job_queue.run_repeating(
@@ -1386,7 +1383,6 @@ async def start_bot():
             first=10
         )
 
-    # Add handlers
     log.info("📝 Adding command handlers...")
     application.add_error_handler(error_handler)
     application.add_handler(CommandHandler("start", start))
@@ -1414,28 +1410,11 @@ async def start_bot():
         )
     )
 
-    # Startup stats
-    file_count = await db.get_file_count()
-    user_count = await db.get_user_count()
-
-    log.info("=" * 50)
-    log.info("🤖 BOT STARTED SUCCESSFULLY! 🎉")
-    log.info("=" * 50)
-    log.info(f"📁 Files in database: {file_count}")
-    log.info(f"👥 Users in database: {user_count}")
-    log.info(f"⏱️  Auto-delete: {DELETE_AFTER//60} minutes")
-    log.info(f"💾 Storage: PERMANENT PostgreSQL")
-    log.info("=" * 50)
-
-    # Remove webhook (important for Render polling)
     log.info("🔗 Removing webhook...")
     await application.bot.delete_webhook(drop_pending_updates=True)
 
-    # Start polling
     log.info("📡 Starting polling...")
     await application.run_polling(allowed_updates=Update.ALL_TYPES)
-    
-
 
 
 
