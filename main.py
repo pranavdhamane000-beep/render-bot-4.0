@@ -1404,12 +1404,9 @@ async def run_bot():
         log.info(f"📢 Broadcast limit: {BROADCAST_LIMIT} users")
         log.info("🤖 Bot starting polling...")
         
-        # Start polling
-        #await application.run_polling(allowed_updates=Update.ALL_TYPES)
-    await application.initialize()
-await application.start()
-await application.updater.start_polling()
-await application.idle()
+        
+        await application.run_polling(allowed_updates=Update.ALL_TYPES)
+    
 
         
     except Exception as e:
@@ -1431,18 +1428,16 @@ def main():
     print(f"✅ Broadcast Limit: {BROADCAST_LIMIT} users")
     print("=" * 60 + "\n")
     
-    # Start Flask in a separate thread
+    # Start Flask in background thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     log.info("🌐 Flask web server thread started")
     
-    # Start bot - THIS IS THE CRITICAL PART
-   # Start bot
-try:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(start_bot())
-
+    # Start bot (FIXED)
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(run_bot())   # ✅ FIXED NAME
     except KeyboardInterrupt:
         print("\n🛑 Bot stopped by user")
     except Exception as e:
@@ -1450,5 +1445,8 @@ try:
     finally:
         print("👋 Bot shutdown complete")
 
+
 if __name__ == "__main__":
     main()
+
+
