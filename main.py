@@ -1433,14 +1433,8 @@ async def start_bot():
 
     # Start polling
     log.info("📡 Starting polling...")
-   # await application.run_polling(allowed_updates=Update.ALL_TYPES)
-     await application.initialize()
-await application.start()
-await application.bot.delete_webhook(drop_pending_updates=True)
-
-log.info("📡 Polling started successfully!")
-
-await application.updater.start_polling()
+    await application.run_polling(allowed_updates=Update.ALL_TYPES)
+    
 
 
 
