@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 import threading
 import pg8000
-import ssl
+import ssl  # Added for SSL context
 from contextlib import asynccontextmanager
 import urllib.parse
 
@@ -18,7 +18,6 @@ db_lock = asyncio.Lock()
 
 # ================= HEALTH SERVER FOR RENDER =================
 from flask import Flask, render_template_string, jsonify
-
 app = Flask(__name__)
 
 # Global variables for web dashboard
@@ -398,7 +397,7 @@ class Database:
                                     first_name: str = None, last_name: str = None,
                                     file_accessed: bool = False):
         """Update user interaction timestamp and count"""
-        async with self.connection_lock:
+        async with self.get_connection():
             # Check if user exists
             exists = await self.fetchrow("SELECT 1 FROM users WHERE user_id = $1", (user_id,))
             
@@ -819,7 +818,7 @@ def health():
 def ping():
     return "pong", 200
 
-def run_flask():
+def run_flask_thread():
     """Run Flask server in a thread"""
     port = int(os.environ.get('PORT', 10000))
     
@@ -1320,7 +1319,7 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
     
-    await db.execute_and_commit('''
+    result = await db.execute_and_commit('''
         DELETE FROM files 
         WHERE timestamp < CURRENT_TIMESTAMP - INTERVAL '1 day' * $1
     ''', (days,))
@@ -1335,7 +1334,7 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 # ============ MAIN ============
-async def main():
+async def start_bot():
     """Start the bot"""
     if not BOT_TOKEN or not ADMIN_ID:
         log.error("Missing BOT_TOKEN or ADMIN_ID")
@@ -1379,15 +1378,10 @@ async def main():
     log.info(f"📁 Files in database: {await db.get_file_count()}")
     log.info(f"👥 Users in database: {await db.get_user_count()}")
     
-    # Start Flask in a separate thread
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    
-    # Start bot
     await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-def main_sync():
-    """Synchronous main function to run the bot"""
+def main():
+    """Main function"""
     print("\n" + "=" * 60)
     print("🤖 TELEGRAM FILE BOT - RENDER POSTGRESQL + pg8000")
     print("=" * 60)
@@ -1397,9 +1391,13 @@ def main_sync():
     print(f"✅ Driver: pg8000 (Pure Python, No Compilation)")
     print("=" * 60 + "\n")
     
+    # Start Flask
+    flask_thread = threading.Thread(target=run_flask_thread, daemon=True)
+    flask_thread.start()
+    
     # Start bot
     try:
-        asyncio.run(main())
+        asyncio.run(start_bot())
     except KeyboardInterrupt:
         print("\n🛑 Bot stopped")
     except Exception as e:
@@ -1411,4 +1409,4 @@ def main_sync():
             pass
 
 if __name__ == "__main__":
-    main_sync()
+    main()
