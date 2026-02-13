@@ -1405,7 +1405,12 @@ async def run_bot():
         log.info("🤖 Bot starting polling...")
         
         # Start polling
-        await application.run_polling(allowed_updates=Update.ALL_TYPES)
+        #await application.run_polling(allowed_updates=Update.ALL_TYPES)
+    await application.initialize()
+await application.start()
+await application.updater.start_polling()
+await application.idle()
+
         
     except Exception as e:
         log.error(f"Fatal error in bot: {e}", exc_info=True)
@@ -1432,9 +1437,12 @@ def main():
     log.info("🌐 Flask web server thread started")
     
     # Start bot - THIS IS THE CRITICAL PART
-    try:
-        # ✅ FIXED: Properly run the async bot function
-        asyncio.run(run_bot())
+   # Start bot
+try:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(start_bot())
+
     except KeyboardInterrupt:
         print("\n🛑 Bot stopped by user")
     except Exception as e:
