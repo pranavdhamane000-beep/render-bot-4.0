@@ -9,13 +9,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 import threading
+import urllib.parse
 
 import pg8000
-from pg8000.native import literal, identifier
-from pg8000 import Connection as SyncConnection
-from pg8000 import Cursor as SyncCursor
-import pg8000.dbapi
 from pg8000 import connect as pg_connect
+from pg8000.native import literal, identifier
 
 from flask import Flask, render_template_string, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -65,30 +63,24 @@ app = Flask(__name__)
 start_time = time.time()
 bot_username = "xiomovies_bot"   # updated later
 
-def get_sync_conn():
-    """Create a synchronous pg8000 connection from DATABASE_URL."""
-    # Parse DATABASE_URL (postgres://user:pass@host:port/dbname)
-    # pg8000.connect accepts keywords: user, password, host, port, database
-    # We'll parse the URL manually.
-    url = DATABASE_URL
+def parse_db_url(url):
+    """Parse DATABASE_URL and return connection parameters."""
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
-    # Simple parsing – works for Render's URL
-    import urllib.parse
     parsed = urllib.parse.urlparse(url)
-    user = parsed.username
-    password = parsed.password
-    host = parsed.hostname
-    port = parsed.port or 5432
-    database = parsed.path.lstrip('/')
-    conn = pg_connect(
-        user=user,
-        password=password,
-        host=host,
-        port=port,
-        database=database,
-        ssl_context=True  # Render requires SSL
-    )
+    return {
+        "user": parsed.username,
+        "password": parsed.password,
+        "host": parsed.hostname,
+        "port": parsed.port or 5432,
+        "database": parsed.path.lstrip('/'),
+        "ssl_context": False  # CRITICAL FIX: Disable SSL certificate verification
+    }
+
+def get_sync_conn():
+    """Create a synchronous pg8000 connection from DATABASE_URL."""
+    params = parse_db_url(DATABASE_URL)
+    conn = pg_connect(**params)
     return conn
 
 def get_db_stats_sync():
@@ -167,7 +159,7 @@ def home():
                 <p><a href="https://t.me/{{ bot_username }}" target="_blank" class="btn">Start @{{ bot_username }}</a></p>
             </div>
             <footer>
-                <small>Render • {{ current_time }} • v2.1 • pg8000</small>
+                <small>Render • {{ current_time }} • v2.1 • pg8000 • SSL verification OFF</small>
             </footer>
         </div>
     </body>
@@ -211,37 +203,19 @@ def run_flask():
 
 # ================= ASYNCHRONOUS PG8000 DATABASE POOL =================
 class AsyncPG8000Pool:
-    """Simple async connection pool for pg8000."""
-    def __init__(self, dsn, min_size=1, max_size=10, ssl=True):
+    """Simple async connection pool for pg8000 with SSL verification disabled."""
+    def __init__(self, dsn, min_size=1, max_size=10):
         self.dsn = dsn
         self.min_size = min_size
         self.max_size = max_size
-        self.ssl = ssl
         self._pool = asyncio.Queue()
         self._size = 0
         self._closed = False
+        self._conn_params = parse_db_url(dsn)  # CRITICAL FIX: SSL disabled
 
     async def _create_conn(self):
-        # Parse DATABASE_URL
-        url = self.dsn
-        if url.startswith("postgres://"):
-            url = url.replace("postgres://", "postgresql://", 1)
-        import urllib.parse
-        parsed = urllib.parse.urlparse(url)
-        user = parsed.username
-        password = parsed.password
-        host = parsed.hostname
-        port = parsed.port or 5432
-        database = parsed.path.lstrip('/')
-        # pg8000 async connect (await)
-        conn = await pg8000.connect(
-            user=user,
-            password=password,
-            host=host,
-            port=port,
-            database=database,
-            ssl_context=True if self.ssl else None
-        )
+        """Create a new async connection with SSL verification disabled."""
+        conn = await pg8000.connect(**self._conn_params)
         return conn
 
     async def init(self):
@@ -262,7 +236,7 @@ class AsyncPG8000Pool:
                 conn = await self._create_conn()
                 self._size += 1
             else:
-                conn = await self._pool.get()  # wait
+                conn = await self._pool.get()
         return conn
 
     async def release(self, conn):
@@ -287,7 +261,6 @@ class Database:
         """Create tables if they don't exist."""
         conn = await self.pool.acquire()
         try:
-            # Using pg8000 async cursor
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS files (
                     id SERIAL PRIMARY KEY,
@@ -352,7 +325,6 @@ class Database:
                 1 if file_info.get('is_video', False) else 0,
                 file_info.get('size', 0)
             )
-            # pg8000 async returns rows as list of tuples; for RETURNING we get one row
             new_id = str(result[0][0])
             log.info(f"💾 Saved file {new_id}: {file_info.get('file_name', '')}")
             return new_id
@@ -368,7 +340,6 @@ class Database:
             """, int(file_id))
             if result:
                 row = result[0]
-                # Update access count
                 await conn.execute("UPDATE files SET access_count = access_count + 1 WHERE id = $1", int(file_id))
                 return {
                     'file_id': row[0],
@@ -389,12 +360,10 @@ class Database:
             return
         conn = await self.pool.acquire()
         try:
-            # Delete old files
             await conn.execute("""
                 DELETE FROM files
                 WHERE timestamp < NOW() - $1::INTERVAL
             """, f'{AUTO_CLEANUP_DAYS} days')
-            # Limit total files (optional)
             await conn.execute("""
                 DELETE FROM files
                 WHERE id NOT IN (
@@ -455,14 +424,7 @@ class Database:
     async def delete_file(self, file_id: str) -> bool:
         conn = await self.pool.acquire()
         try:
-            result = await conn.execute("DELETE FROM files WHERE id = $1", int(file_id))
-            # pg8000 returns number of rows affected as string like "DELETE 1"
-            # For async, execute returns the rows list; but to get rowcount we can use:
-            # In pg8000 async, execute returns the result set; rowcount is available via conn.rowcount
-            # However, with our pool we are using a single connection; we can access rowcount after execute.
-            # But the async API: await conn.execute() returns the result; rowcount is an attribute of the connection?
-            # Actually, in pg8000 async, execute() returns the results, and you can get rowcount from conn.rowcount.
-            # Let's do: await conn.execute(...); deleted = conn.rowcount
+            await conn.execute("DELETE FROM files WHERE id = $1", int(file_id))
             deleted = conn.rowcount > 0
             if deleted:
                 log.info(f"🗑️ Deleted file {file_id}")
@@ -516,13 +478,11 @@ class Database:
         finally:
             await self.pool.release(conn)
 
-    # ---------- User tracking ----------
     async def update_user_interaction(self, user_id: int, username: str = None,
                                       first_name: str = None, last_name: str = None,
                                       file_accessed: bool = False):
         conn = await self.pool.acquire()
         try:
-            # Upsert user
             await conn.execute("""
                 INSERT INTO users (user_id, username, first_name, last_name, first_seen, last_active, total_interactions)
                 VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)
@@ -911,7 +871,6 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.error(f"Callback file send failed: {e}")
             await query.edit_message_text("❌ Failed to send file. Try again later.")
 
-# ---------- Admin commands ----------
 async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
@@ -1193,7 +1152,7 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     conn = await db.pool.acquire()
     try:
-        result = await conn.execute("DELETE FROM files WHERE timestamp < NOW() - $1::INTERVAL", f'{days} days')
+        await conn.execute("DELETE FROM files WHERE timestamp < NOW() - $1::INTERVAL", f'{days} days')
         deleted = conn.rowcount
         sent = await update.message.reply_text(f"🧹 Manual cleanup: removed {deleted} files older than {days} days.")
         await schedule_message_deletion(context, sent.chat_id, sent.message_id)
@@ -1230,11 +1189,15 @@ async def init_application():
 
 async def main():
     global db
-    print("🚀 Starting bot with PostgreSQL (pg8000)...")
-    pool = AsyncPG8000Pool(DATABASE_URL, min_size=1, max_size=10, ssl=True)
+    print("🚀 Starting bot with PostgreSQL (pg8000) - SSL verification disabled...")
+    
+    # CRITICAL FIX: Create pool with SSL verification disabled
+    pool = AsyncPG8000Pool(DATABASE_URL, min_size=1, max_size=10)
     await pool.init()
+    
     db = Database(pool)
     await db.init_tables()
+    
     file_cnt = await db.get_file_count()
     user_cnt = await db.get_user_count()
     log.info(f"📊 Files: {file_cnt}, Users: {user_cnt}")
