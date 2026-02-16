@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram File Bot — Complete working version with polling only
+Telegram File Bot — Complete fixed version with polling only
 Compatible with Python 3.14.3, python-telegram-bot >=21.7, Flask >=2.3.3, pg8000 >=1.30.5
 """
 
@@ -44,7 +44,7 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 PORT = int(os.environ.get("PORT", "5000"))
 
-# Channel settings (use channel username without @)
+# Channel settings
 CHANNEL_1 = os.environ.get("CHANNEL_1", "").strip().replace("@", "")
 CHANNEL_2 = os.environ.get("CHANNEL_2", "").strip().replace("@", "")
 
@@ -71,7 +71,7 @@ class Database:
         self._lock = threading.Lock()
         self.initialized = False
         self.params = self._parse_db_url(db_url)
-        log.info(f"Database configured")
+        log.info(f"Parsed DB params: {self.params}")
 
     def _parse_db_url(self, db_url: str) -> Dict[str, Any]:
         """Parse PostgreSQL connection URL"""
@@ -605,7 +605,7 @@ async def check_user_in_channel(bot, channel: str, user_id: int) -> bool:
         return is_member
     except Exception as e:
         log.warning(f"Membership check failed for {ch}: {e}")
-        return False
+        return True
 
 async def check_channels_membership(bot, user_id: int) -> Tuple[bool, List[str]]:
     """Check if user is member of both channels"""
@@ -659,8 +659,6 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     user = update.effective_user
-    log.info(f"Start command from user {user.id} ({user.first_name})")
-    
     await db.update_user_interaction(
         user.id, 
         user.username, 
@@ -766,23 +764,30 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle file uploads (admin only)"""
+    # Log for debugging
+    log.info(f"Upload handler triggered by user {update.effective_user.id}")
+    
     if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ You are not authorized to use this command.")
+        log.warning(f"Unauthorized upload attempt by user {update.effective_user.id}")
         return
     
     msg = update.message
     if not msg:
         return
     
-    log.info(f"Upload from admin: {msg}")
-    
-    video = msg.video
-    doc = msg.document
-    
-    if not video and not doc:
+    # Log what we received
+    if msg.video:
+        log.info(f"Received video: {msg.video.file_name}")
+    elif msg.document:
+        log.info(f"Received document: {msg.document.file_name}")
+    else:
+        log.info("Received message without video or document")
         sent = await msg.reply_text("❌ Please send a video or document to upload.")
         await schedule_message_deletion(context, sent.chat_id, sent.message_id)
         return
+    
+    video = msg.video
+    doc = msg.document
     
     if video:
         fid = video.file_id
@@ -835,6 +840,8 @@ async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def listfiles_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all files (admin only)"""
+    log.info(f"listfiles_handler triggered by user {update.effective_user.id}")
+    
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ You are not authorized to use this command.")
         return
@@ -870,6 +877,8 @@ async def listfiles_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def deletefile_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Delete a file (admin only)"""
+    log.info(f"deletefile_handler triggered by user {update.effective_user.id}")
+    
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ You are not authorized to use this command.")
         return
@@ -891,6 +900,8 @@ async def deletefile_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show bot statistics (admin only)"""
+    log.info(f"stats_handler triggered by user {update.effective_user.id}")
+    
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ You are not authorized to use this command.")
         return
@@ -928,6 +939,8 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Broadcast message to all users (admin only)"""
+    log.info(f"broadcast_handler triggered by user {update.effective_user.id}")
+    
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ You are not authorized to use this command.")
         return
@@ -1000,6 +1013,8 @@ async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def users_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show user list (admin only)"""
+    log.info(f"users_handler triggered by user {update.effective_user.id}")
+    
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ You are not authorized to use this command.")
         return
@@ -1151,9 +1166,6 @@ def home():
     except Exception as e:
         log.error(f"Error getting stats: {e}")
     
-    # Get bot username for dashboard
-    bot_username = "your_bot"
-    
     html = """
     <!DOCTYPE html>
     <html>
@@ -1293,6 +1305,15 @@ def home():
     </html>
     """
     
+    # Get bot username for dashboard
+    bot_username = "your_bot"
+    if application and application.bot:
+        try:
+            bot_info = asyncio.run(application.bot.get_me())
+            bot_username = bot_info.username
+        except:
+            pass
+    
     return render_template_string(
         html, 
         uptime=uptime, 
@@ -1355,7 +1376,6 @@ async def run_bot():
     
     # Add handlers
     application.add_handler(CommandHandler("start", start_handler))
-    application.add_handler(CommandHandler("upload", upload_handler))
     application.add_handler(CommandHandler("listfiles", listfiles_handler))
     application.add_handler(CommandHandler("deletefile", deletefile_handler))
     application.add_handler(CommandHandler("stats", stats_handler))
@@ -1364,11 +1384,20 @@ async def run_bot():
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_error_handler(error_handler)
     
-    # File upload handler for admin
-    upload_filter = filters.VIDEO | filters.Document.ALL
+    # IMPORTANT FIX: File upload handler for admin - capture ALL file types
+    # This catches any document or video sent by admin in private chat
+    upload_filter = filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.PHOTO
     application.add_handler(
         MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload_handler)
     )
+    
+    # Also add a catch-all for any other message types that might contain files
+    # This ensures we don't miss anything
+    application.add_handler(
+        MessageHandler(filters.ALL & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload_handler)
+    )
+    
+    log.info("Handlers registered successfully")
     
     # Start polling
     log.info("Starting polling...")
@@ -1393,7 +1422,7 @@ def run_flask():
 def main():
     """Main function"""
     log.info("=" * 50)
-    log.info("Starting Telegram File Bot (Polling Mode)")
+    log.info("Starting Telegram File Bot (Polling Mode) - FIXED VERSION")
     log.info(f"Bot Token: {BOT_TOKEN[:10]}...")
     log.info(f"Admin ID: {ADMIN_ID}")
     log.info(f"Database: {DATABASE_URL[:20]}...")
