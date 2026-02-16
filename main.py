@@ -14,9 +14,8 @@ import pg8000
 from contextlib import asynccontextmanager
 import urllib.parse
 import functools
-import socket
 
-# ================= HEALTH SERVER FOR RENDER ==================
+# ================= HEALTH SERVER FOR RENDER =================
 from flask import Flask, render_template_string, jsonify, request
 import threading
 
@@ -38,7 +37,6 @@ from telegram.ext import (
     ContextTypes,
     JobQueue
 )
-from telegram.error import TelegramError
 
 # ================= CONFIG =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -55,54 +53,16 @@ if not DATABASE_URL:
     print("💡 Add a PostgreSQL database in Render Dashboard and copy its Internal Database URL")
     raise ValueError("DATABASE_URL environment variable is required!")
 
-# ============ 🔥 AUTO-DETECT WEBHOOK URL - NO ENV VAR NEEDED! ============
-def get_render_url():
-    """Auto-detect Render URL from environment or socket"""
-    
-    # Method 1: Render sets this automatically for internal communication
-    render_service_url = os.environ.get("RENDER_SERVICE_URL", "")
-    if render_service_url:
-        return render_service_url.rstrip('/')
-    
-    # Method 2: Construct from service name if available
-    service_name = os.environ.get("RENDER_SERVICE_NAME", "")
-    if service_name:
-        return f"https://{service_name}.onrender.com"
-    
-    # Method 3: Try to get from Render's internal hostname
-    render_hostname = os.environ.get("RENDER_HOSTNAME", "")
-    if render_hostname:
-        return f"https://{render_hostname}"
-    
-    # Method 4: Last resort - try to detect from socket
-    try:
-        # Get the external hostname (this is a best guess)
-        hostname = socket.gethostname()
-        if 'render' in hostname:
-            return f"https://{hostname}"
-    except:
-        pass
-    
-    # If all else fails, return None (will be handled by caller)
-    return None
-
-# Auto-detect the Render URL
-RENDER_EXTERNAL_URL = get_render_url()
-
+# ============ 🔥 WEBHOOK CONFIGURATION ============
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip('/')
 if not RENDER_EXTERNAL_URL:
-    print("\n" + "="*60)
-    print("⚠️  COULD NOT AUTO-DETECT RENDER URL")
-    print("="*60)
-    print("The bot will still work, but you need to set the webhook manually:")
-    print("1. Deploy the bot first")
-    print("2. Check your Render dashboard for your app URL")
-    print("3. Set webhook using: https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=https://your-app.onrender.com/telegram-webhook")
-    print("="*60 + "\n")
-    # Use a placeholder - webhook will need to be set manually
-    RENDER_EXTERNAL_URL = "https://your-app.onrender.com"  # Placeholder
+    print("❌ ERROR: RENDER_EXTERNAL_URL is not set!")
+    print("💡 Set it to your Render app URL (e.g., https://your-app.onrender.com)")
+    raise ValueError("RENDER_EXTERNAL_URL environment variable is required!")
 
 WEBHOOK_PATH = "/telegram-webhook"
 WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
+PORT = int(os.environ.get('PORT', 10000))
 
 DELETE_AFTER = 600  # 10 minutes
 MAX_STORED_FILES = 10000
@@ -896,29 +856,49 @@ def get_db_stats_sync():
         log.error(f"Error getting sync stats: {e}")
         return 0, 0
 
-# ✅ WEBHOOK ROUTE
+
+# ✅ WEBHOOK ROUTE - FIXED VERSION
 @app.route(WEBHOOK_PATH, methods=["POST"])
-async def telegram_webhook():
-    """Handle incoming Telegram updates"""
+def telegram_webhook():
+    """Handle incoming Telegram updates via webhook"""
     global application
 
     if application is None:
-        return "bot not ready", 503
+        log.warning("Webhook received but application not ready")
+        return "Bot not ready", 503
 
     try:
+        # Get the update from Telegram
         data = request.get_json(force=True)
-        update = Update.de_json(data, application.bot)
-
-        # Process the update asynchronously
-        await application.process_update(update)
-        return "ok", 200
+        
+        # Create a new event loop for this request
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            # Convert to Update object
+            update = Update.de_json(data, application.bot)
+            
+            # Process the update
+            loop.run_until_complete(application.process_update(update))
+        finally:
+            loop.close()
+        
+        return "OK", 200
 
     except Exception as e:
         log.error(f"Webhook error: {e}", exc_info=True)
-        return "error", 500
+        return "Error", 500
+
 
 @app.route('/')
 def home():
+    uptime_seconds = time.time() - start_time
+    uptime_str = str(timedelta(seconds=int(uptime_seconds)))
+    
+    # Use synchronous database access
+    file_count, user_count = get_db_stats_sync()
+    
     html_content = """
     <!DOCTYPE html>
 <html>
@@ -1019,12 +999,6 @@ def home():
 </html>
     """
     
-    uptime_seconds = time.time() - start_time
-    uptime_str = str(timedelta(seconds=int(uptime_seconds)))
-    
-    # Use synchronous database access
-    file_count, user_count = get_db_stats_sync()
-    
     return render_template_string(html_content, 
                                   bot_username=bot_username,
                                   uptime=uptime_str,
@@ -1057,6 +1031,20 @@ def health():
 @app.route('/ping')
 def ping():
     return "pong", 200
+
+def run_flask_thread():
+    """Run Flask server in a thread"""
+    port = int(os.environ.get('FLASK_PORT', 5000))
+    
+    import warnings
+    warnings.filterwarnings("ignore")
+    
+    import logging as flask_logging
+    flask_logging.getLogger('werkzeug').setLevel(flask_logging.ERROR)
+    flask_logging.getLogger('flask').setLevel(flask_logging.ERROR)
+    
+    # Run Flask on a different port than the webhook
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False, threaded=True)
 
 # ============ COMMAND HANDLERS ============
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1563,7 +1551,7 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ BOT STARTUP WITH WEBHOOK ============
 async def start_bot():
     """Start the bot with Flask webhook"""
-    global db_initialized, bot_username, application, RENDER_EXTERNAL_URL, WEBHOOK_URL
+    global db_initialized, bot_username, application
 
     if not BOT_TOKEN or not ADMIN_ID:
         log.error("Missing BOT_TOKEN or ADMIN_ID")
@@ -1581,14 +1569,6 @@ async def start_bot():
     bot_info = await application.bot.get_me()
     bot_username = bot_info.username
     log.info(f"✅ Bot username: @{bot_username}")
-
-    # Try to auto-detect URL again (in case environment changed)
-    if RENDER_EXTERNAL_URL == "https://your-app.onrender.com":  # Still placeholder
-        new_url = get_render_url()
-        if new_url:
-            RENDER_EXTERNAL_URL = new_url
-            WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
-            log.info(f"✅ Auto-detected Render URL: {RENDER_EXTERNAL_URL}")
 
     # Add handlers
     application.add_error_handler(error_handler)
@@ -1613,13 +1593,16 @@ async def start_bot():
     await application.initialize()
     await application.start()
 
-    # SET WEBHOOK
-    try:
-        await application.bot.set_webhook(WEBHOOK_URL)
-        log.info(f"✅ Webhook set successfully to: {WEBHOOK_URL}")
-    except Exception as e:
-        log.error(f"❌ Failed to set webhook: {e}")
-        log.info("ℹ️ You may need to set webhook manually using Telegram API")
+    # SET WEBHOOK - Using RENDER_EXTERNAL_URL instead of hardcoded URL
+    webhook_url = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
+    await application.bot.set_webhook(webhook_url)
+    
+    # Verify webhook was set
+    webhook_info = await application.bot.get_webhook_info()
+    if webhook_info.url == webhook_url:
+        log.info(f"✅ Webhook set successfully to: {webhook_url}")
+    else:
+        log.error(f"❌ Webhook set failed. Current: {webhook_info.url}")
 
     log.info("🤖 Bot running with Flask webhook")
 
@@ -1627,33 +1610,34 @@ async def start_bot():
     await asyncio.Event().wait()
 
 def main():
-    """Main function - runs both Flask and Bot on same port"""
+    """Main function - runs both Flask and Bot"""
     print("\n" + "=" * 60)
-    print("🤖 TELEGRAM FILE BOT - RENDER POSTGRESQL + WEBHOOK (Python 3.14)")
+    print("🤖 TELEGRAM FILE BOT - RENDER POSTGRESQL + WEBHOOK")
     print("=" * 60)
-    print(f"✅ Auto-detected URL: {RENDER_EXTERNAL_URL}")
+    print(f"✅ Bot: @{bot_username}")
     print(f"✅ Webhook URL: {WEBHOOK_URL}")
     print(f"✅ Webhook Path: {WEBHOOK_PATH}")
-    print(f"✅ Port: {os.environ.get('PORT', '10000')} (both Flask and webhook)")
+    print(f"✅ Flask Port: 5000 (dashboard)")
+    print(f"✅ Bot Port: {PORT} (webhook)")
     print("=" * 60 + "\n")
     
-    # Get port from environment (Render uses PORT env var)
-    port = int(os.environ.get("PORT", 10000))
+    # Start Flask dashboard in a separate thread (on port 5000)
+    flask_thread = threading.Thread(target=run_flask_thread, daemon=True)
+    flask_thread.start()
+    log.info(f"✅ Flask dashboard started on port 5000")
     
-    # Suppress Flask logs
-    import warnings
-    warnings.filterwarnings("ignore")
-    import logging as flask_logging
-    flask_logging.getLogger('werkzeug').setLevel(flask_logging.ERROR)
-    flask_logging.getLogger('flask').setLevel(flask_logging.ERROR)
-    
-    # Start bot in a separate thread
-    bot_thread = threading.Thread(target=lambda: asyncio.run(start_bot()), daemon=True)
-    bot_thread.start()
-    
-    # Run Flask on the same port (this blocks)
-    log.info(f"✅ Flask server starting on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False, threaded=True)
+    # Start bot with webhook (this blocks)
+    try:
+        asyncio.run(start_bot())
+    except KeyboardInterrupt:
+        print("\n🛑 Bot stopped")
+    except Exception as e:
+        log.error(f"Fatal error: {e}", exc_info=True)
+    finally:
+        try:
+            asyncio.run(db.close())
+        except:
+            pass
 
 if __name__ == "__main__":
     main()
