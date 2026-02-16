@@ -49,21 +49,21 @@ RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 WEBHOOK_PATH = "/telegram-webhook"
 WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}" if RENDER_EXTERNAL_URL else ""
 PORT = int(os.environ.get("PORT", "5000"))
-BOT_USERNAME = os.environ.get("BOT_USERNAME", "file_bot")
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "")
 
 # Channel settings
 CHANNEL_1 = os.environ.get("CHANNEL_1", "").strip().replace("@", "")
 CHANNEL_2 = os.environ.get("CHANNEL_2", "").strip().replace("@", "")
 
 DELETE_AFTER = int(os.environ.get("DELETE_AFTER", "600"))  # seconds (10 minutes)
-PLAYABLE_EXTS = {"mp4", "mov", "m4v", "mpeg", "mpg", "webm", "mkv"}
+PLAYABLE_EXTS = {"mp4", "mov", "m4v", "mpeg", "mpg", "webm", "mkv", "avi"}
 ALL_VIDEO_EXTS = {
     "mp4", "mkv", "mov", "avi", "webm", "flv", "m4v", "3gp", "wmv", "mpg", "mpeg"
 }
 
 # Validate required env vars
-if not (BOT_TOKEN and ADMIN_ID and DATABASE_URL and RENDER_EXTERNAL_URL):
-    log.error("Missing one of required env vars: BOT_TOKEN, ADMIN_ID, DATABASE_URL, RENDER_EXTERNAL_URL")
+if not (BOT_TOKEN and ADMIN_ID and DATABASE_URL):
+    log.error("Missing one of required env vars: BOT_TOKEN, ADMIN_ID, DATABASE_URL")
     sys.exit(1)
 
 # ---------- Flask app ----------
@@ -675,31 +675,48 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     args = context.args
     
+    # If there are channels configured, always show channel join first
+    if CHANNEL_1 or CHANNEL_2:
+        is_member, missing = await check_channels_membership(context.bot, user.id)
+        
+        if not is_member:
+            # If user has a file key, pass it to the callback
+            file_key = args[0] if args else None
+            keyboard = get_membership_keyboard(missing, file_key)
+            
+            channel_names = []
+            if CHANNEL_1:
+                channel_names.append(f"@{CHANNEL_1}")
+            if CHANNEL_2:
+                channel_names.append(f"@{CHANNEL_2}")
+            
+            channels_text = " & ".join(channel_names)
+            
+            sent = await update.message.reply_text(
+                f"🔒 **Access Restricted**\n\n"
+                f"To use this bot, you must join our channel{'s' if len(channel_names) > 1 else ''} first:\n"
+                f"{channels_text}\n\n"
+                f"Please join and click the button below:",
+                reply_markup=keyboard,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+            return
+    
+    # If no channels or user is already a member, handle file access or welcome
     if not args:
         welcome_text = (
             f"👋 Welcome {user.first_name}!\n\n"
             "This bot helps you access files shared by the admin.\n\n"
             "📁 To access a file, use the special link provided by the admin.\n"
-            "🔒 Some files may require joining our channels first.\n"
             f"⏳ All messages auto-delete after {DELETE_AFTER//60} minutes."
         )
-        
-        if CHANNEL_1 or CHANNEL_2:
-            is_member, missing = await check_channels_membership(context.bot, user.id)
-            
-            if not is_member:
-                keyboard = get_membership_keyboard(missing)
-                sent = await update.message.reply_text(
-                    "🔒 Please join our channels first to access files:",
-                    reply_markup=keyboard
-                )
-                await schedule_message_deletion(context, sent.chat_id, sent.message_id)
-                return
         
         sent = await update.message.reply_text(welcome_text)
         await schedule_message_deletion(context, sent.chat_id, sent.message_id)
         return
     
+    # Handle file access with key
     key = args[0]
     info = await db.get_file(key)
     
@@ -708,16 +725,18 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await schedule_message_deletion(context, sent.chat_id, sent.message_id)
         return
     
-    is_member, missing = await check_channels_membership(context.bot, user.id)
-    
-    if not is_member:
-        keyboard = get_membership_keyboard(missing, key)
-        sent = await update.message.reply_text(
-            "🔒 Please join our channels first to access this file:",
-            reply_markup=keyboard
-        )
-        await schedule_message_deletion(context, sent.chat_id, sent.message_id)
-        return
+    # Double-check membership (in case they joined after seeing the channel message)
+    if CHANNEL_1 or CHANNEL_2:
+        is_member, missing = await check_channels_membership(context.bot, user.id)
+        
+        if not is_member:
+            keyboard = get_membership_keyboard(missing, key)
+            sent = await update.message.reply_text(
+                "🔒 You still need to join our channels to access this file:",
+                reply_markup=keyboard
+            )
+            await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+            return
     
     await db.update_user_interaction(
         user.id, 
@@ -783,9 +802,9 @@ async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mime = video.mime_type or "video/mp4"
         size = video.file_size or 0
         is_video = True
-    else:
+    else:  # document
         fid = doc.file_id
-        fname = doc.file_name or f"doc_{int(time.time())}"
+        fname = doc.file_name or f"file_{int(time.time())}"
         mime = doc.mime_type or ""
         size = doc.file_size or 0
         ext = fname.lower().split(".")[-1] if "." in fname else ""
@@ -800,21 +819,29 @@ async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     key = await db.save_file(fid, file_info)
     
+    # Get bot username if not set
+    global BOT_USERNAME
+    if not BOT_USERNAME and context.bot:
+        bot_info = await context.bot.get_me()
+        BOT_USERNAME = bot_info.username
+    
+    # Create the shareable link
     if BOT_USERNAME:
         link = f"https://t.me/{BOT_USERNAME}?start={key}"
     else:
-        link = f"Use start parameter: {key}"
+        link = f"Use this key: {key}"
     
     size_mb = size / (1024 * 1024)
     
     response = (
-        f"✅ File saved successfully!\n\n"
-        f"📄 Name: {fname}\n"
-        f"📊 Size: {size_mb:.2f} MB\n"
-        f"🔑 Key: `{key}`\n"
-        f"🔗 Link: {link}\n\n"
-        f"Use /listfiles to see all files\n"
-        f"Use /deletefile {key} to delete this file"
+        f"✅ **File saved successfully!**\n\n"
+        f"📄 **Name:** `{fname}`\n"
+        f"📊 **Size:** {size_mb:.2f} MB\n"
+        f"🔑 **File ID:** `{key}`\n"
+        f"🔗 **Share Link:**\n`{link}`\n\n"
+        f"**Commands:**\n"
+        f"• /listfiles - View all files\n"
+        f"• /deletefile {key} - Delete this file"
     )
     
     sent = await msg.reply_text(response, parse_mode=ParseMode.MARKDOWN)
@@ -1018,11 +1045,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query:
         return
     
-    # Always answer the callback query to stop the loading animation
     await query.answer()
     
     data = query.data
-    log.info(f"Callback received: {data}")  # Debug log
+    log.info(f"Callback received: {data}")
     
     if data == "check_membership":
         user = query.from_user
@@ -1036,7 +1062,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_member:
             await query.edit_message_text(
                 "✅ Thank you for joining! You can now access files.\n"
-                "Use the original file link again."
+                "Send /start to begin."
             )
         else:
             keyboard = get_membership_keyboard(missing)
@@ -1155,6 +1181,13 @@ def home():
     except Exception as e:
         log.error(f"Error getting stats: {e}")
     
+    # Auto-detect external URL from request if not set
+    global RENDER_EXTERNAL_URL, WEBHOOK_URL
+    if not RENDER_EXTERNAL_URL and request.headers.get('Host'):
+        scheme = 'https' if request.headers.get('X-Forwarded-Proto', 'http') == 'https' else 'http'
+        RENDER_EXTERNAL_URL = f"{scheme}://{request.headers['Host']}"
+        WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
+    
     html = """
     <!DOCTYPE html>
     <html>
@@ -1267,7 +1300,7 @@ def home():
                     </div>
                     <div class="stat-item">
                         <div class="stat-value">{{ uptime.split()[0] }}</div>
-                        <div class="stat-label">Uptime</div>
+                        <div class="stat-label">Uptime (days)</div>
                     </div>
                 </div>
                 
@@ -1348,7 +1381,7 @@ def ping():
 # ---------- Bot startup ----------
 async def start_bot():
     """Start the bot"""
-    global application, db
+    global application, db, BOT_USERNAME, WEBHOOK_URL, RENDER_EXTERNAL_URL
     
     log.info("Starting bot initialization...")
     
@@ -1359,9 +1392,16 @@ async def start_bot():
     application = Application.builder().token(BOT_TOKEN).build()
     
     bot_info = await application.bot.get_me()
-    global BOT_USERNAME
     BOT_USERNAME = bot_info.username
     log.info(f"Bot username: @{BOT_USERNAME}")
+    
+    # Try to set webhook if URL is available
+    if RENDER_EXTERNAL_URL:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        await application.bot.set_webhook(url=WEBHOOK_URL)
+        log.info(f"Webhook set: {WEBHOOK_URL}")
+    else:
+        log.warning("RENDER_EXTERNAL_URL not set, webhook not configured")
     
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(CommandHandler("upload", upload_handler))
@@ -1381,11 +1421,7 @@ async def start_bot():
     await application.initialize()
     await application.start()
     
-    await application.bot.delete_webhook(drop_pending_updates=True)
-    await application.bot.set_webhook(url=WEBHOOK_URL)
-    log.info(f"Webhook set: {WEBHOOK_URL}")
-    
-    log.info("Bot is running with webhook")
+    log.info("Bot is running")
     
     while True:
         await asyncio.sleep(3600)
@@ -1401,7 +1437,8 @@ def main():
     log.info("Starting Telegram File Bot")
     log.info(f"Bot Token: {BOT_TOKEN[:10]}...")
     log.info(f"Admin ID: {ADMIN_ID}")
-    log.info(f"Webhook URL: {WEBHOOK_URL}")
+    log.info(f"Database: {DATABASE_URL[:20]}...")
+    log.info(f"Webhook URL: {WEBHOOK_URL or 'Not set (will auto-detect)'}")
     log.info(f"Channel 1: {CHANNEL_1 or 'Not set'}")
     log.info(f"Channel 2: {CHANNEL_2 or 'Not set'}")
     log.info("=" * 50)
