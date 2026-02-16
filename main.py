@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram File Bot — Complete version with polling only
+Telegram File Bot — Complete working version with polling only
 Compatible with Python 3.14.3, python-telegram-bot >=21.7, Flask >=2.3.3, pg8000 >=1.30.5
 """
 
@@ -44,7 +44,7 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 PORT = int(os.environ.get("PORT", "5000"))
 
-# Channel settings
+# Channel settings (use channel username without @)
 CHANNEL_1 = os.environ.get("CHANNEL_1", "").strip().replace("@", "")
 CHANNEL_2 = os.environ.get("CHANNEL_2", "").strip().replace("@", "")
 
@@ -71,7 +71,7 @@ class Database:
         self._lock = threading.Lock()
         self.initialized = False
         self.params = self._parse_db_url(db_url)
-        log.info(f"Parsed DB params: {self.params}")
+        log.info(f"Database configured")
 
     def _parse_db_url(self, db_url: str) -> Dict[str, Any]:
         """Parse PostgreSQL connection URL"""
@@ -605,7 +605,7 @@ async def check_user_in_channel(bot, channel: str, user_id: int) -> bool:
         return is_member
     except Exception as e:
         log.warning(f"Membership check failed for {ch}: {e}")
-        return True
+        return False
 
 async def check_channels_membership(bot, user_id: int) -> Tuple[bool, List[str]]:
     """Check if user is member of both channels"""
@@ -659,6 +659,8 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     user = update.effective_user
+    log.info(f"Start command from user {user.id} ({user.first_name})")
+    
     await db.update_user_interaction(
         user.id, 
         user.username, 
@@ -765,11 +767,14 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle file uploads (admin only)"""
     if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ You are not authorized to use this command.")
         return
     
     msg = update.message
     if not msg:
         return
+    
+    log.info(f"Upload from admin: {msg}")
     
     video = msg.video
     doc = msg.document
@@ -1146,6 +1151,9 @@ def home():
     except Exception as e:
         log.error(f"Error getting stats: {e}")
     
+    # Get bot username for dashboard
+    bot_username = "your_bot"
+    
     html = """
     <!DOCTYPE html>
     <html>
@@ -1284,15 +1292,6 @@ def home():
     </body>
     </html>
     """
-    
-    # Get bot username for dashboard
-    bot_username = "your_bot"
-    if application and application.bot:
-        try:
-            bot_info = asyncio.run(application.bot.get_me())
-            bot_username = bot_info.username
-        except:
-            pass
     
     return render_template_string(
         html, 
