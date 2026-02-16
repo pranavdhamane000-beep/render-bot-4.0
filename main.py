@@ -14,6 +14,7 @@ import pg8000
 from contextlib import asynccontextmanager
 import urllib.parse
 import functools
+import socket
 
 # ================= HEALTH SERVER FOR RENDER ==================
 from flask import Flask, render_template_string, jsonify, request
@@ -54,12 +55,51 @@ if not DATABASE_URL:
     print("💡 Add a PostgreSQL database in Render Dashboard and copy its Internal Database URL")
     raise ValueError("DATABASE_URL environment variable is required!")
 
-# ============ 🔥 WEBHOOK CONFIGURATION ============
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip('/')
+# ============ 🔥 AUTO-DETECT WEBHOOK URL - NO ENV VAR NEEDED! ============
+def get_render_url():
+    """Auto-detect Render URL from environment or socket"""
+    
+    # Method 1: Render sets this automatically for internal communication
+    render_service_url = os.environ.get("RENDER_SERVICE_URL", "")
+    if render_service_url:
+        return render_service_url.rstrip('/')
+    
+    # Method 2: Construct from service name if available
+    service_name = os.environ.get("RENDER_SERVICE_NAME", "")
+    if service_name:
+        return f"https://{service_name}.onrender.com"
+    
+    # Method 3: Try to get from Render's internal hostname
+    render_hostname = os.environ.get("RENDER_HOSTNAME", "")
+    if render_hostname:
+        return f"https://{render_hostname}"
+    
+    # Method 4: Last resort - try to detect from socket
+    try:
+        # Get the external hostname (this is a best guess)
+        hostname = socket.gethostname()
+        if 'render' in hostname:
+            return f"https://{hostname}"
+    except:
+        pass
+    
+    # If all else fails, return None (will be handled by caller)
+    return None
+
+# Auto-detect the Render URL
+RENDER_EXTERNAL_URL = get_render_url()
+
 if not RENDER_EXTERNAL_URL:
-    print("❌ ERROR: RENDER_EXTERNAL_URL is not set!")
-    print("💡 Set it to your Render app URL (e.g., https://your-app.onrender.com)")
-    raise ValueError("RENDER_EXTERNAL_URL environment variable is required!")
+    print("\n" + "="*60)
+    print("⚠️  COULD NOT AUTO-DETECT RENDER URL")
+    print("="*60)
+    print("The bot will still work, but you need to set the webhook manually:")
+    print("1. Deploy the bot first")
+    print("2. Check your Render dashboard for your app URL")
+    print("3. Set webhook using: https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook?url=https://your-app.onrender.com/telegram-webhook")
+    print("="*60 + "\n")
+    # Use a placeholder - webhook will need to be set manually
+    RENDER_EXTERNAL_URL = "https://your-app.onrender.com"  # Placeholder
 
 WEBHOOK_PATH = "/telegram-webhook"
 WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
@@ -1523,7 +1563,7 @@ async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ BOT STARTUP WITH WEBHOOK ============
 async def start_bot():
     """Start the bot with Flask webhook"""
-    global db_initialized, bot_username, application
+    global db_initialized, bot_username, application, RENDER_EXTERNAL_URL, WEBHOOK_URL
 
     if not BOT_TOKEN or not ADMIN_ID:
         log.error("Missing BOT_TOKEN or ADMIN_ID")
@@ -1541,6 +1581,14 @@ async def start_bot():
     bot_info = await application.bot.get_me()
     bot_username = bot_info.username
     log.info(f"✅ Bot username: @{bot_username}")
+
+    # Try to auto-detect URL again (in case environment changed)
+    if RENDER_EXTERNAL_URL == "https://your-app.onrender.com":  # Still placeholder
+        new_url = get_render_url()
+        if new_url:
+            RENDER_EXTERNAL_URL = new_url
+            WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
+            log.info(f"✅ Auto-detected Render URL: {RENDER_EXTERNAL_URL}")
 
     # Add handlers
     application.add_error_handler(error_handler)
@@ -1566,11 +1614,14 @@ async def start_bot():
     await application.start()
 
     # SET WEBHOOK
-    await application.bot.set_webhook(WEBHOOK_URL)
+    try:
+        await application.bot.set_webhook(WEBHOOK_URL)
+        log.info(f"✅ Webhook set successfully to: {WEBHOOK_URL}")
+    except Exception as e:
+        log.error(f"❌ Failed to set webhook: {e}")
+        log.info("ℹ️ You may need to set webhook manually using Telegram API")
 
-    log.info("✅ Webhook set successfully")
     log.info("🤖 Bot running with Flask webhook")
-    log.info(f"📡 Webhook URL: {WEBHOOK_URL}")
 
     # keep running forever
     await asyncio.Event().wait()
@@ -1580,7 +1631,7 @@ def main():
     print("\n" + "=" * 60)
     print("🤖 TELEGRAM FILE BOT - RENDER POSTGRESQL + WEBHOOK (Python 3.14)")
     print("=" * 60)
-    print(f"✅ Bot: @{bot_username}")
+    print(f"✅ Auto-detected URL: {RENDER_EXTERNAL_URL}")
     print(f"✅ Webhook URL: {WEBHOOK_URL}")
     print(f"✅ Webhook Path: {WEBHOOK_PATH}")
     print(f"✅ Port: {os.environ.get('PORT', '10000')} (both Flask and webhook)")
