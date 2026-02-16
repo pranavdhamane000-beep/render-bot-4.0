@@ -1,19 +1,1439 @@
+#!/usr/bin/env python3
+"""
+Telegram File Bot — Complete version with all features
+Compatible with Python 3.14.3, python-telegram-bot >=21.7, Flask >=2.3.3, pg8000 >=1.30.5
+"""
+
+import os
+import sys
+import time
+import ssl
+import logging
+import threading
 import asyncio
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+import urllib.parse
+import signal
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any, Tuple
+from contextlib import suppress
+from collections import defaultdict
 
-BOT_TOKEN = "8519948867:AAHXkGX6uOGUQOpQnrCgdFpfZMcXl_2P-DA"  # <-- put your real token
+import pg8000
+from flask import Flask, request, jsonify, render_template_string
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hello 👋")
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 
-async def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+# ---------- Config & Logging ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+log = logging.getLogger("telegram-file-bot")
+log.setLevel(logging.INFO)
 
-    app.add_handler(CommandHandler("start", start))
+# Environment variables
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+WEBHOOK_PATH = "/telegram-webhook"
+WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}" if RENDER_EXTERNAL_URL else ""
+PORT = int(os.environ.get("PORT", "5000"))
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "file_bot")  # optional helpful fallback
 
-    print("Bot is running...")
-    await app.run_polling()
+# Channel settings (add your channel usernames here)
+CHANNEL_1 = os.environ.get("CHANNEL_1", "").strip()  # e.g., "@channel1" or "channel1"
+CHANNEL_2 = os.environ.get("CHANNEL_2", "").strip()  # e.g., "@channel2" or "channel2"
+
+DELETE_AFTER = int(os.environ.get("DELETE_AFTER", "600"))  # seconds (10 minutes)
+PLAYABLE_EXTS = {"mp4", "mov", "m4v", "mpeg", "mpg", "webm", "mkv"}
+ALL_VIDEO_EXTS = {
+    "mp4", "mkv", "mov", "avi", "webm", "flv", "m4v", "3gp", "wmv", "mpg", "mpeg"
+}
+
+# Validate required env vars
+if not (BOT_TOKEN and ADMIN_ID and DATABASE_URL and RENDER_EXTERNAL_URL):
+    log.error("Missing one of required env vars: BOT_TOKEN, ADMIN_ID, DATABASE_URL, RENDER_EXTERNAL_URL")
+    sys.exit(1)
+
+# ---------- Flask app ----------
+app = Flask(__name__)
+start_time = time.time()
+
+# ---------- Database helper ----------
+class Database:
+    def __init__(self, db_url: str):
+        self.db_url = db_url
+        self.conn = None
+        self._lock = threading.Lock()
+        self.initialized = False
+        self.params = self._parse_db_url(db_url)
+        log.info(f"Parsed DB params: {self.params}")
+
+    def _parse_db_url(self, db_url: str) -> Dict[str, Any]:
+        """Parse PostgreSQL connection URL"""
+        s = db_url.replace("postgresql://", "").replace("postgres://", "")
+        user_pass, host_port_db = s.split("@", 1)
+        user, password = user_pass.split(":", 1)
+        password = urllib.parse.unquote(password)
+        
+        if "/" in host_port_db:
+            host_port, database = host_port_db.split("/", 1)
+        else:
+            host_port = host_port_db
+            database = "postgres"
+            
+        if ":" in host_port:
+            host, port = host_port.split(":", 1)
+            port = int(port)
+        else:
+            host = host_port
+            port = 5432
+            
+        return {
+            "user": user, 
+            "password": password, 
+            "host": host, 
+            "port": port, 
+            "database": database
+        }
+
+    def _ssl_ctx(self):
+        """Create SSL context for database connection"""
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    def connect_sync(self, database: Optional[str] = None):
+        """Synchronous database connection"""
+        params = self.params.copy()
+        if database:
+            params["database"] = database
+            
+        return pg8000.connect(
+            user=params["user"],
+            password=params["password"],
+            host=params["host"],
+            port=params["port"],
+            database=params["database"],
+            ssl_context=self._ssl_ctx(),
+            timeout=30,
+        )
+
+    async def ensure_database(self):
+        """Ensure database exists"""
+        def _ensure():
+            target = self.params["database"]
+            try:
+                conn = self.connect_sync(target)
+                conn.close()
+                return True
+            except Exception:
+                # Try to create using postgres database
+                try:
+                    conn = self.connect_sync("postgres")
+                    cur = conn.cursor()
+                    conn.autocommit = True
+                    cur.execute(f'CREATE DATABASE "{target}"')
+                    conn.close()
+                    return True
+                except Exception as e:
+                    log.error(f"Failed to create database: {e}")
+                    raise
+        return await asyncio.to_thread(_ensure)
+
+    async def get_connection(self):
+        """Get or create database connection"""
+        with self._lock:
+            if self.conn is None:
+                self.conn = await asyncio.to_thread(self.connect_sync, self.params.get("database"))
+        return self.conn
+
+    async def init_db(self):
+        """Initialize database tables"""
+        conn = await self.get_connection()
+        
+        def _init():
+            cur = conn.cursor()
+            
+            # Files table
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS files (
+                    id SERIAL PRIMARY KEY,
+                    file_id TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    mime_type TEXT,
+                    is_video INTEGER DEFAULT 0,
+                    file_size BIGINT DEFAULT 0,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    access_count INTEGER DEFAULT 0,
+                    last_accessed TIMESTAMP
+                )
+            ''')
+            
+            # Membership cache table
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS membership_cache (
+                    user_id BIGINT,
+                    channel TEXT,
+                    is_member INTEGER,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, channel)
+                )
+            ''')
+            
+            # Scheduled deletions table
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS scheduled_deletions (
+                    chat_id BIGINT NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    scheduled_time TIMESTAMP NOT NULL,
+                    delete_after INTEGER DEFAULT 600,
+                    PRIMARY KEY (chat_id, message_id)
+                )
+            ''')
+            
+            # Users table with enhanced tracking
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    total_interactions INTEGER DEFAULT 1,
+                    total_files_accessed INTEGER DEFAULT 0,
+                    last_file_accessed TIMESTAMP,
+                    membership_checked TIMESTAMP
+                )
+            ''')
+            
+            # Create indexes for better performance
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_files_access_count ON files(access_count)')
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(timestamp)')
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active)')
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_scheduled_deletions_time ON scheduled_deletions(scheduled_time)')
+            
+            conn.commit()
+            
+        await asyncio.to_thread(_init)
+        self.initialized = True
+        log.info("Database initialized successfully")
+
+    async def save_file(self, file_id: str, file_info: dict) -> str:
+        """Save file information to database"""
+        conn = await self.get_connection()
+        
+        def _save():
+            cur = conn.cursor()
+            cur.execute(
+                """INSERT INTO files 
+                   (file_id, file_name, mime_type, is_video, file_size, access_count) 
+                   VALUES (%s,%s,%s,%s,%s,0) RETURNING id""",
+                (
+                    file_id, 
+                    file_info.get("file_name", ""), 
+                    file_info.get("mime_type", ""), 
+                    1 if file_info.get("is_video") else 0, 
+                    int(file_info.get("size", 0))
+                )
+            )
+            nid = cur.fetchone()[0]
+            conn.commit()
+            return str(nid)
+            
+        return await asyncio.to_thread(_save)
+
+    async def get_file(self, key: str) -> Optional[dict]:
+        """Get file information by ID and increment access count"""
+        try:
+            kid = int(key)
+        except ValueError:
+            return None
+            
+        conn = await self.get_connection()
+        
+        def _get():
+            cur = conn.cursor()
+            cur.execute(
+                """UPDATE files 
+                   SET access_count = access_count + 1, last_accessed = CURRENT_TIMESTAMP 
+                   WHERE id = %s 
+                   RETURNING file_id, file_name, mime_type, is_video, file_size, 
+                             TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS'), access_count""",
+                (kid,)
+            )
+            row = cur.fetchone()
+            if row:
+                conn.commit()
+                return {
+                    "file_id": row[0], 
+                    "file_name": row[1], 
+                    "mime_type": row[2], 
+                    "is_video": bool(row[3]), 
+                    "size": row[4], 
+                    "timestamp": row[5], 
+                    "access_count": row[6]
+                }
+            return None
+            
+        return await asyncio.to_thread(_get)
+
+    async def delete_file(self, key: str) -> bool:
+        """Delete file by ID"""
+        try:
+            kid = int(key)
+        except ValueError:
+            return False
+            
+        conn = await self.get_connection()
+        
+        def _del():
+            cur = conn.cursor()
+            cur.execute("DELETE FROM files WHERE id = %s", (kid,))
+            rc = cur.rowcount
+            conn.commit()
+            return rc > 0
+            
+        return await asyncio.to_thread(_del)
+
+    async def get_file_count(self) -> int:
+        """Get total number of files"""
+        conn = await self.get_connection()
+        
+        def _c():
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM files")
+            return cur.fetchone()[0]
+            
+        return await asyncio.to_thread(_c)
+
+    async def get_all_files(self, limit: int = 100) -> List[tuple]:
+        """Get all files with details"""
+        conn = await self.get_connection()
+        
+        def _g():
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT id, file_name, file_size, access_count, 
+                          TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS') 
+                   FROM files ORDER BY timestamp DESC LIMIT %s""",
+                (limit,)
+            )
+            return cur.fetchall()
+            
+        return await asyncio.to_thread(_g)
+
+    async def get_user_count(self) -> int:
+        """Get total number of users"""
+        conn = await self.get_connection()
+        
+        def _c():
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM users")
+            return cur.fetchone()[0]
+            
+        return await asyncio.to_thread(_c)
+
+    async def get_active_users(self, days: int = 7) -> int:
+        """Get number of active users in last X days"""
+        conn = await self.get_connection()
+        
+        def _c():
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM users WHERE last_active >= CURRENT_TIMESTAMP - INTERVAL '%s days'",
+                (days,)
+            )
+            return cur.fetchone()[0]
+            
+        return await asyncio.to_thread(_c)
+
+    async def get_new_users(self, days: int = 7) -> int:
+        """Get number of new users in last X days"""
+        conn = await self.get_connection()
+        
+        def _c():
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT COUNT(*) FROM users WHERE first_seen >= CURRENT_TIMESTAMP - INTERVAL '%s days'",
+                (days,)
+            )
+            return cur.fetchone()[0]
+            
+        return await asyncio.to_thread(_c)
+
+    async def get_top_users(self, limit: int = 10) -> List[tuple]:
+        """Get users with most file accesses"""
+        conn = await self.get_connection()
+        
+        def _g():
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT user_id, username, first_name, total_files_accessed, 
+                          TO_CHAR(last_active, 'YYYY-MM-DD HH24:MI:SS') 
+                   FROM users 
+                   WHERE total_files_accessed > 0 
+                   ORDER BY total_files_accessed DESC 
+                   LIMIT %s""",
+                (limit,)
+            )
+            return cur.fetchall()
+            
+        return await asyncio.to_thread(_g)
+
+    async def schedule_deletion(self, chat_id: int, message_id: int):
+        """Schedule a message for deletion"""
+        conn = await self.get_connection()
+        st = datetime.now() + timedelta(seconds=DELETE_AFTER)
+        
+        def _s():
+            cur = conn.cursor()
+            cur.execute(
+                """INSERT INTO scheduled_deletions (chat_id, message_id, scheduled_time, delete_after) 
+                   VALUES (%s,%s,%s,%s) 
+                   ON CONFLICT (chat_id, message_id) 
+                   DO UPDATE SET scheduled_time = EXCLUDED.scheduled_time""",
+                (chat_id, message_id, st, DELETE_AFTER)
+            )
+            conn.commit()
+            
+        return await asyncio.to_thread(_s)
+
+    async def get_due_messages(self) -> List[Tuple[int, int]]:
+        """Get messages due for deletion"""
+        conn = await self.get_connection()
+        
+        def _g():
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT chat_id, message_id FROM scheduled_deletions WHERE scheduled_time <= CURRENT_TIMESTAMP"
+            )
+            return cur.fetchall()
+            
+        return await asyncio.to_thread(_g)
+
+    async def remove_scheduled(self, chat_id: int, message_id: int):
+        """Remove scheduled deletion"""
+        conn = await self.get_connection()
+        
+        def _r():
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM scheduled_deletions WHERE chat_id = %s AND message_id = %s",
+                (chat_id, message_id)
+            )
+            conn.commit()
+            
+        return await asyncio.to_thread(_r)
+
+    async def update_user_interaction(
+        self, 
+        user_id: int, 
+        username: Optional[str] = None, 
+        first_name: Optional[str] = None, 
+        last_name: Optional[str] = None, 
+        file_accessed: bool = False
+    ):
+        """Update user interaction statistics"""
+        conn = await self.get_connection()
+        
+        def _u():
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM users WHERE user_id = %s", (user_id,))
+            
+            if cur.fetchone():
+                # Update existing user
+                cur.execute(
+                    """UPDATE users 
+                       SET last_active = CURRENT_TIMESTAMP, 
+                           total_interactions = total_interactions + 1,
+                           username = COALESCE(%s, username),
+                           first_name = COALESCE(%s, first_name),
+                           last_name = COALESCE(%s, last_name)
+                       WHERE user_id = %s""",
+                    (username, first_name, last_name, user_id)
+                )
+                
+                if file_accessed:
+                    cur.execute(
+                        """UPDATE users 
+                           SET total_files_accessed = total_files_accessed + 1, 
+                               last_file_accessed = CURRENT_TIMESTAMP 
+                           WHERE user_id = %s""",
+                        (user_id,)
+                    )
+            else:
+                # Insert new user
+                cur.execute(
+                    """INSERT INTO users 
+                       (user_id, username, first_name, last_name, total_files_accessed) 
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (user_id, username, first_name, last_name, 1 if file_accessed else 0)
+                )
+                
+            conn.commit()
+            
+        return await asyncio.to_thread(_u)
+
+    async def get_all_user_ids(self, exclude_admin: bool = True) -> List[int]:
+        """Get all user IDs"""
+        conn = await self.get_connection()
+        
+        def _g():
+            cur = conn.cursor()
+            if exclude_admin:
+                cur.execute("SELECT user_id FROM users WHERE user_id != %s", (ADMIN_ID,))
+            else:
+                cur.execute("SELECT user_id FROM users")
+            return [r[0] for r in cur.fetchall()]
+            
+        return await asyncio.to_thread(_g)
+
+    async def update_membership_cache(self, user_id: int, channel: str, is_member: bool):
+        """Update membership cache"""
+        conn = await self.get_connection()
+        
+        def _u():
+            cur = conn.cursor()
+            cur.execute(
+                """INSERT INTO membership_cache (user_id, channel, is_member) 
+                   VALUES (%s, %s, %s) 
+                   ON CONFLICT (user_id, channel) 
+                   DO UPDATE SET is_member = %s, timestamp = CURRENT_TIMESTAMP""",
+                (user_id, channel, 1 if is_member else 0, 1 if is_member else 0)
+            )
+            conn.commit()
+            
+        return await asyncio.to_thread(_u)
+
+    async def check_membership_cache(self, user_id: int, channel: str) -> Optional[bool]:
+        """Check cached membership status"""
+        conn = await self.get_connection()
+        
+        def _c():
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT is_member, timestamp 
+                   FROM membership_cache 
+                   WHERE user_id = %s AND channel = %s 
+                   AND timestamp > CURRENT_TIMESTAMP - INTERVAL '1 hour'""",
+                (user_id, channel)
+            )
+            row = cur.fetchone()
+            if row:
+                return bool(row[0])
+            return None
+            
+        return await asyncio.to_thread(_c)
+
+    async def cleanup_old_cache(self, hours: int = 24):
+        """Clean up old cache entries"""
+        conn = await self.get_connection()
+        
+        def _c():
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM membership_cache WHERE timestamp < CURRENT_TIMESTAMP - INTERVAL '%s hours'",
+                (hours,)
+            )
+            conn.commit()
+            return cur.rowcount
+            
+        return await asyncio.to_thread(_c)
+
+
+db = Database(DATABASE_URL)
+
+# ---------- Bot & handlers ----------
+application: Optional[Application] = None
+bot_loop: Optional[asyncio.AbstractEventLoop] = None
+
+async def _delete_job(context: ContextTypes.DEFAULT_TYPE):
+    """Job to delete messages"""
+    job = context.job
+    chat_id = job.chat_id
+    message_id = job.data
+    
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        await db.remove_scheduled(chat_id, message_id)
+    except Exception as e:
+        log.warning(f"Failed to delete message {message_id}: {e}")
+        await db.remove_scheduled(chat_id, message_id)
+
+async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
+    """Schedule message deletion"""
+    try:
+        await db.schedule_deletion(chat_id, message_id)
+        if context.job_queue:
+            context.job_queue.run_once(
+                _delete_job, 
+                DELETE_AFTER, 
+                data=message_id, 
+                chat_id=chat_id,
+                name=f"delete_{chat_id}_{message_id}"
+            )
+    except Exception as e:
+        log.warning(f"schedule_message_deletion failed: {e}")
+
+async def check_user_in_channel(bot, channel: str, user_id: int) -> bool:
+    """Check if user is member of a channel"""
+    if not channel:
+        return True
+        
+    # Format channel username
+    ch = channel if channel.startswith("@") else f"@{channel}"
+    
+    # Check cache first
+    cached = await db.check_membership_cache(user_id, ch)
+    if cached is not None:
+        return cached
+    
+    try:
+        mem = await bot.get_chat_member(chat_id=ch, user_id=user_id)
+        is_member = mem.status in ("member", "administrator", "creator")
+        
+        # Update cache
+        await db.update_membership_cache(user_id, ch, is_member)
+        
+        return is_member
+    except Exception as e:
+        log.warning(f"Membership check failed for {ch}: {e}")
+        # If we can't check, allow access (fail open)
+        return True
+
+async def check_channels_membership(bot, user_id: int) -> Tuple[bool, List[str]]:
+    """Check if user is member of both channels"""
+    if not CHANNEL_1 and not CHANNEL_2:
+        return True, []
+    
+    missing_channels = []
+    
+    if CHANNEL_1:
+        is_member = await check_user_in_channel(bot, CHANNEL_1, user_id)
+        if not is_member:
+            missing_channels.append(CHANNEL_1)
+    
+    if CHANNEL_2:
+        is_member = await check_user_in_channel(bot, CHANNEL_2, user_id)
+        if not is_member:
+            missing_channels.append(CHANNEL_2)
+    
+    return len(missing_channels) == 0, missing_channels
+
+def get_membership_keyboard(missing_channels: List[str]) -> InlineKeyboardMarkup:
+    """Create keyboard for missing channels"""
+    keyboard = []
+    
+    for channel in missing_channels:
+        ch = channel if channel.startswith("@") else f"@{channel}"
+        # Remove @ for display
+        display_ch = ch[1:] if ch.startswith("@") else ch
+        keyboard.append([
+            InlineKeyboardButton(
+                f"📢 Join {display_ch}", 
+                url=f"https://t.me/{display_ch}"
+            )
+        ])
+    
+    keyboard.append([
+        InlineKeyboardButton("✅ I've Joined", callback_data="check_membership")
+    ])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+# Handlers
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    if not update.message or not update.effective_user:
+        return
+    
+    user = update.effective_user
+    await db.update_user_interaction(
+        user.id, 
+        user.username, 
+        user.first_name, 
+        user.last_name
+    )
+    
+    args = context.args
+    
+    if not args:
+        # Regular start without file key
+        welcome_text = (
+            f"👋 Welcome {user.first_name}!\n\n"
+            "This bot helps you access files shared by the admin.\n\n"
+            "📁 To access a file, use the special link provided by the admin.\n"
+            "🔒 Some files may require joining our channels first.\n"
+            "⏳ All messages auto-delete after 10 minutes."
+        )
+        
+        # Check if channels are configured
+        if CHANNEL_1 or CHANNEL_2:
+            is_member, missing = await check_channels_membership(context.bot, user.id)
+            
+            if not is_member:
+                keyboard = get_membership_keyboard(missing)
+                sent = await update.message.reply_text(
+                    "🔒 Please join our channels first to access files:",
+                    reply_markup=keyboard
+                )
+                await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+                return
+        
+        sent = await update.message.reply_text(welcome_text)
+        await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+        return
+    
+    # Handle file access
+    key = args[0]
+    info = await db.get_file(key)
+    
+    if not info:
+        sent = await update.message.reply_text("❌ File not found or has been deleted.")
+        await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+        return
+    
+    # Check channel membership
+    is_member, missing = await check_channels_membership(context.bot, user.id)
+    
+    if not is_member:
+        keyboard = get_membership_keyboard(missing)
+        sent = await update.message.reply_text(
+            "🔒 Please join our channels first to access this file:",
+            reply_markup=keyboard
+        )
+        await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+        return
+    
+    # Update user interaction with file access
+    await db.update_user_interaction(
+        user.id, 
+        user.username, 
+        user.first_name, 
+        user.last_name,
+        file_accessed=True
+    )
+    
+    # Send file
+    try:
+        fname = info["file_name"]
+        ext = fname.lower().split(".")[-1] if "." in fname else ""
+        
+        # Prepare caption with file info
+        size_mb = info["size"] / (1024 * 1024)
+        caption = (
+            f"📄 {fname}\n"
+            f"📊 Size: {size_mb:.2f} MB\n"
+            f"👀 Views: {info['access_count']}\n"
+            f"⏳ Auto-deletes in {DELETE_AFTER//60} minutes"
+        )
+        
+        if info["is_video"] and ext in PLAYABLE_EXTS:
+            sent = await context.bot.send_video(
+                chat_id=update.effective_chat.id,
+                video=info["file_id"],
+                caption=caption,
+                supports_streaming=True
+            )
+        else:
+            sent = await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=info["file_id"],
+                caption=caption
+            )
+            
+        await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+        
+    except Exception as e:
+        log.exception("Failed to send file")
+        sent = await update.message.reply_text("❌ Failed to send file. Please try again later.")
+        await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+
+async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle file uploads (admin only)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    msg = update.message
+    if not msg:
+        return
+    
+    video = msg.video
+    doc = msg.document
+    
+    if not video and not doc:
+        sent = await msg.reply_text("❌ Please send a video or document to upload.")
+        await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+        return
+    
+    # Process video
+    if video:
+        fid = video.file_id
+        fname = video.file_name or f"video_{int(time.time())}.mp4"
+        mime = video.mime_type or "video/mp4"
+        size = video.file_size or 0
+        is_video = True
+    
+    # Process document
+    else:
+        fid = doc.file_id
+        fname = doc.file_name or f"doc_{int(time.time())}"
+        mime = doc.mime_type or ""
+        size = doc.file_size or 0
+        ext = fname.lower().split(".")[-1] if "." in fname else ""
+        is_video = ext in ALL_VIDEO_EXTS
+    
+    # Save to database
+    file_info = {
+        "file_name": fname, 
+        "mime_type": mime, 
+        "is_video": is_video, 
+        "size": int(size)
+    }
+    
+    key = await db.save_file(fid, file_info)
+    
+    # Create share link
+    if BOT_USERNAME:
+        link = f"https://t.me/{BOT_USERNAME}?start={key}"
+    else:
+        link = f"Use start parameter: {key}"
+    
+    size_mb = size / (1024 * 1024)
+    
+    response = (
+        f"✅ File saved successfully!\n\n"
+        f"📄 Name: {fname}\n"
+        f"📊 Size: {size_mb:.2f} MB\n"
+        f"🔑 Key: `{key}`\n"
+        f"🔗 Link: {link}\n\n"
+        f"Use /listfiles to see all files\n"
+        f"Use /deletefile {key} to delete this file"
+    )
+    
+    sent = await msg.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+    await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+
+async def listfiles_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all files (admin only)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    rows = await db.get_all_files(limit=100)
+    
+    if not rows:
+        sent = await update.message.reply_text("📁 No files stored yet.")
+        await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+        return
+    
+    msg = "📁 **Stored Files:**\n\n"
+    
+    for i, row in enumerate(rows, 1):
+        fid, name, size, access, ts = row
+        size_kb = size // 1024
+        size_mb = size / (1024 * 1024)
+        
+        if size_mb >= 1:
+            size_str = f"{size_mb:.2f} MB"
+        else:
+            size_str = f"{size_kb} KB"
+        
+        msg += f"{i}. `{fid}` - {name[:40]}\n"
+        msg += f"   📊 {size_str} | 👀 {access} views | 📅 {ts}\n\n"
+        
+        if len(msg) > 3500:  # Telegram message limit
+            msg += "... (truncated)"
+            break
+    
+    sent = await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+
+async def deletefile_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Delete a file (admin only)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    if not context.args:
+        sent = await update.message.reply_text("❌ Usage: /deletefile <file_id>")
+        await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+        return
+    
+    key = context.args[0]
+    ok = await db.delete_file(key)
+    
+    if ok:
+        sent = await update.message.reply_text(f"✅ File {key} deleted successfully.")
+    else:
+        sent = await update.message.reply_text(f"❌ File {key} not found.")
+    
+    await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+
+async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show bot statistics (admin only)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    # Gather statistics
+    uptime = str(timedelta(seconds=int(time.time() - start_time)))
+    files = await db.get_file_count()
+    users = await db.get_user_count()
+    active_7d = await db.get_active_users(7)
+    active_30d = await db.get_active_users(30)
+    new_7d = await db.get_new_users(7)
+    new_30d = await db.get_new_users(30)
+    
+    # Get top users
+    top_users = await db.get_top_users(5)
+    
+    stats_msg = (
+        f"📊 **Bot Statistics**\n\n"
+        f"⏱️ Uptime: {uptime}\n"
+        f"📁 Total Files: {files}\n"
+        f"👥 Total Users: {users}\n\n"
+        f"📈 **Activity**\n"
+        f"• Active (7d): {active_7d}\n"
+        f"• Active (30d): {active_30d}\n"
+        f"• New (7d): {new_7d}\n"
+        f"• New (30d): {new_30d}\n\n"
+    )
+    
+    if top_users:
+        stats_msg += "🏆 **Top Users**\n"
+        for i, (uid, username, first_name, accesses, last_active) in enumerate(top_users, 1):
+            name = username or first_name or str(uid)
+            stats_msg += f"{i}. {name[:20]} - {accesses} files\n"
+    
+    sent = await update.message.reply_text(stats_msg, parse_mode=ParseMode.MARKDOWN)
+    await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+
+async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Broadcast message to all users (admin only)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    # Get message text
+    if not context.args and not update.message.reply_to_message:
+        sent = await update.message.reply_text(
+            "❌ Usage: /broadcast <message> or reply to a message with /broadcast"
+        )
+        await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+        return
+    
+    if update.message.reply_to_message:
+        text = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
+    else:
+        text = " ".join(context.args)
+    
+    if not text:
+        sent = await update.message.reply_text("❌ Message cannot be empty.")
+        await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+        return
+    
+    # Get all users
+    user_ids = await db.get_all_user_ids(exclude_admin=True)
+    
+    if not user_ids:
+        sent = await update.message.reply_text("❌ No users to broadcast to.")
+        await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+        return
+    
+    # Send broadcast
+    status_msg = await update.message.reply_text(
+        f"📢 Broadcasting to {len(user_ids)} users...\n"
+        f"This may take a few moments."
+    )
+    
+    success = 0
+    failed = 0
+    failed_users = []
+    
+    for i, uid in enumerate(user_ids, 1):
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text=f"📢 **Broadcast Message**\n\n{text}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            success += 1
+            
+            # Update status every 10 users
+            if i % 10 == 0:
+                await status_msg.edit_text(
+                    f"📢 Broadcasting...\n"
+                    f"Progress: {i}/{len(user_ids)}\n"
+                    f"✅ Sent: {success}\n"
+                    f"❌ Failed: {failed}"
+                )
+            
+            # Small delay to avoid flooding
+            await asyncio.sleep(0.05)
+            
+        except Exception as e:
+            failed += 1
+            failed_users.append(str(uid))
+            log.warning(f"Failed to broadcast to {uid}: {e}")
+    
+    # Final status
+    result_msg = (
+        f"✅ **Broadcast Complete**\n\n"
+        f"📊 **Results:**\n"
+        f"• Total users: {len(user_ids)}\n"
+        f"• ✅ Sent: {success}\n"
+        f"• ❌ Failed: {failed}\n"
+    )
+    
+    if failed_users and len(failed_users) <= 10:
+        result_msg += f"\nFailed users: {', '.join(failed_users)}"
+    elif failed_users:
+        result_msg += f"\nFirst 10 failed: {', '.join(failed_users[:10])}"
+    
+    await status_msg.edit_text(result_msg, parse_mode=ParseMode.MARKDOWN)
+    await schedule_message_deletion(context, status_msg.chat_id, status_msg.message_id)
+
+async def users_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show user list (admin only)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    # Get user stats
+    total_users = await db.get_user_count()
+    active_7d = await db.get_active_users(7)
+    active_30d = await db.get_active_users(30)
+    new_7d = await db.get_new_users(7)
+    
+    # Get top users
+    top_users = await db.get_top_users(10)
+    
+    msg = (
+        f"👥 **User Statistics**\n\n"
+        f"📊 **Overview:**\n"
+        f"• Total Users: {total_users}\n"
+        f"• Active (7d): {active_7d}\n"
+        f"• Active (30d): {active_30d}\n"
+        f"• New (7d): {new_7d}\n\n"
+    )
+    
+    if top_users:
+        msg += "🏆 **Top 10 Users by File Access:**\n\n"
+        for i, (uid, username, first_name, accesses, last_active) in enumerate(top_users, 1):
+            name = username or first_name or f"User {uid}"
+            msg += f"{i}. {name[:30]}\n"
+            msg += f"   📁 {accesses} files | Last: {last_active}\n\n"
+    
+    sent = await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+
+async def cleanup_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual cleanup of old cache (admin only)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    deleted = await db.cleanup_old_cache(1)  # Clean cache older than 1 hour
+    
+    sent = await update.message.reply_text(f"🧹 Cleaned up {deleted} old cache entries.")
+    await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle callback queries"""
+    query = update.callback_query
+    if not query:
+        return
+    
+    await query.answer()
+    
+    if query.data == "check_membership":
+        user = query.from_user
+        
+        if not CHANNEL_1 and not CHANNEL_2:
+            await query.edit_message_text("✅ No channels to check!")
+            return
+        
+        is_member, missing = await check_channels_membership(context.bot, user.id)
+        
+        if is_member:
+            await query.edit_message_text(
+                "✅ Thank you for joining! You can now access files.\n"
+                "Use the original file link again."
+            )
+        else:
+            keyboard = get_membership_keyboard(missing)
+            await query.edit_message_text(
+                "🔒 You still need to join these channels:",
+                reply_markup=keyboard
+            )
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors"""
+    log.error(f"Update {update} caused error {context.error}")
+
+# ---------- Bot startup inside thread ----------
+async def start_bot_async(app_obj: Application):
+    """Start bot asynchronously"""
+    # Initialize database
+    await db.ensure_database()
+    await db.init_db()
+    log.info("Database ready")
+    
+    # Add handlers
+    app_obj.add_handler(CommandHandler("start", start_handler))
+    app_obj.add_handler(CommandHandler("upload", upload_handler))
+    app_obj.add_handler(CommandHandler("listfiles", listfiles_handler))
+    app_obj.add_handler(CommandHandler("deletefile", deletefile_handler))
+    app_obj.add_handler(CommandHandler("stats", stats_handler))
+    app_obj.add_handler(CommandHandler("broadcast", broadcast_handler))
+    app_obj.add_handler(CommandHandler("users", users_handler))
+    app_obj.add_handler(CommandHandler("cleanup", cleanup_handler))
+    app_obj.add_handler(CallbackQueryHandler(callback_handler))
+    app_obj.add_error_handler(error_handler)
+    
+    # Initialize and set webhook
+    await app_obj.initialize()
+    await app_obj.bot.delete_webhook(drop_pending_updates=True)
+    await app_obj.bot.set_webhook(url=WEBHOOK_URL)
+    log.info(f"Webhook set: {WEBHOOK_URL}")
+    
+    await app_obj.start()
+    log.info("Application started")
+    
+    # Keep running
+    await asyncio.Event().wait()
+
+def bot_thread_target(loop: asyncio.BaseEventLoop, app_obj: Application):
+    """Target function for bot thread"""
+    asyncio.set_event_loop(loop)
+    
+    try:
+        loop.run_until_complete(start_bot_async(app_obj))
+    except Exception:
+        log.exception("Bot thread crashed")
+    finally:
+        with suppress(Exception):
+            loop.run_until_complete(app_obj.stop())
+        loop.close()
+
+def start_bot_in_thread():
+    """Start bot in separate thread"""
+    global application, bot_loop
+    
+    application = Application.builder().token(BOT_TOKEN).build()
+    bot_loop = asyncio.new_event_loop()
+    
+    t = threading.Thread(target=bot_thread_target, args=(bot_loop, application), daemon=True)
+    t.start()
+    
+    # Wait briefly for initialization
+    time.sleep(1)
+    log.info("Bot thread started")
+
+# ---------- Flask webhook route ----------
+@app.route(WEBHOOK_PATH, methods=["POST"])
+def telegram_webhook():
+    """Handle Telegram webhook"""
+    global application, bot_loop
+    
+    if application is None or bot_loop is None:
+        return "Bot not ready", 503
+    
+    try:
+        data = request.get_json(force=True)
+        upd = Update.de_json(data, application.bot)
+        
+        # Process update in bot's event loop
+        fut = asyncio.run_coroutine_threadsafe(
+            application.process_update(upd), 
+            bot_loop
+        )
+        
+        # Wait briefly for errors
+        with suppress(Exception):
+            fut.result(timeout=5)
+            
+        return "ok", 200
+        
+    except Exception:
+        log.exception("Webhook forward failed")
+        return "error", 500
+
+# ---------- Dashboard routes ----------
+@app.route("/", methods=["GET"])
+def home():
+    """Web dashboard"""
+    uptime = str(timedelta(seconds=int(time.time() - start_time)))
+    file_count = user_count = 0
+    
+    try:
+        if db.initialized:
+            file_count = asyncio.run(db.get_file_count())
+            user_count = asyncio.run(db.get_user_count())
+    except Exception:
+        pass
+    
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Telegram File Bot</title>
+        <style>
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                margin: 0;
+                padding: 20px;
+                min-height: 100vh;
+                color: #333;
+            }
+            .container {
+                max-width: 800px;
+                margin: 0 auto;
+            }
+            .card {
+                background: white;
+                border-radius: 15px;
+                padding: 30px;
+                box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+                margin-bottom: 20px;
+            }
+            h1 {
+                margin: 0 0 20px 0;
+                color: #333;
+                font-size: 2em;
+            }
+            .stats-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 20px;
+                margin: 30px 0;
+            }
+            .stat-item {
+                background: #f8f9fa;
+                border-radius: 10px;
+                padding: 20px;
+                text-align: center;
+            }
+            .stat-value {
+                font-size: 2.5em;
+                font-weight: bold;
+                color: #667eea;
+                margin-bottom: 5px;
+            }
+            .stat-label {
+                color: #666;
+                font-size: 0.9em;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+            }
+            .info-row {
+                display: flex;
+                justify-content: space-between;
+                padding: 10px 0;
+                border-bottom: 1px solid #eee;
+            }
+            .info-label {
+                color: #666;
+                font-weight: 500;
+            }
+            .info-value {
+                color: #333;
+                font-family: monospace;
+            }
+            .badge {
+                display: inline-block;
+                padding: 5px 10px;
+                border-radius: 5px;
+                font-size: 0.8em;
+                font-weight: bold;
+            }
+            .badge-success {
+                background: #d4edda;
+                color: #155724;
+            }
+            .footer {
+                text-align: center;
+                color: white;
+                margin-top: 20px;
+            }
+            .footer a {
+                color: white;
+                text-decoration: none;
+                opacity: 0.8;
+            }
+            .footer a:hover {
+                opacity: 1;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="card">
+                <h1>🤖 Telegram File Bot</h1>
+                
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <div class="stat-value">{{ files }}</div>
+                        <div class="stat-label">Total Files</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value">{{ users }}</div>
+                        <div class="stat-label">Total Users</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value">{{ uptime.split()[0] }}</div>
+                        <div class="stat-label">Uptime</div>
+                    </div>
+                </div>
+                
+                <div class="info-row">
+                    <span class="info-label">Bot Status</span>
+                    <span class="info-value"><span class="badge badge-success">✅ Active</span></span>
+                </div>
+                
+                <div class="info-row">
+                    <span class="info-label">Webhook URL</span>
+                    <span class="info-value"><code>{{ webhook }}</code></span>
+                </div>
+                
+                <div class="info-row">
+                    <span class="info-label">Database</span>
+                    <span class="info-value"><span class="badge badge-success">✅ Connected</span></span>
+                </div>
+                
+                {% if channel_1 or channel_2 %}
+                <div class="info-row">
+                    <span class="info-label">Channels</span>
+                    <span class="info-value">
+                        {% if channel_1 %}{{ channel_1 }}{% endif %}
+                        {% if channel_2 %}{% if channel_1 %}, {% endif %}{{ channel_2 }}{% endif %}
+                    </span>
+                </div>
+                {% endif %}
+                
+                <div style="margin-top: 30px; text-align: center;">
+                    <a href="https://t.me/{{ bot_username }}" target="_blank" style="background: #667eea; color: white; padding: 10px 20px; border-radius: 5px; text-decoration: none;">Open Bot</a>
+                </div>
+            </div>
+            
+            <div class="footer">
+                <p>Made with ❤️ for Telegram</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return render_template_string(
+        html, 
+        uptime=uptime, 
+        files=file_count, 
+        users=user_count, 
+        webhook=WEBHOOK_URL,
+        channel_1=CHANNEL_1,
+        channel_2=CHANNEL_2,
+        bot_username=BOT_USERNAME
+    )
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "ok",
+        "uptime_seconds": int(time.time() - start_time),
+        "webhook": WEBHOOK_URL,
+        "db_initialized": db.initialized,
+        "channels": {
+            "channel1": bool(CHANNEL_1),
+            "channel2": bool(CHANNEL_2)
+        }
+    }), 200
+
+@app.route("/ping", methods=["GET"])
+def ping():
+    """Ping endpoint"""
+    return "pong", 200
+
+@app.route("/stats/json", methods=["GET"])
+def stats_json():
+    """JSON statistics endpoint"""
+    if not db.initialized:
+        return jsonify({"error": "Database not initialized"}), 503
+    
+    try:
+        file_count = asyncio.run(db.get_file_count())
+        user_count = asyncio.run(db.get_user_count())
+        active_7d = asyncio.run(db.get_active_users(7))
+        active_30d = asyncio.run(db.get_active_users(30))
+        new_7d = asyncio.run(db.get_new_users(7))
+        
+        return jsonify({
+            "uptime": int(time.time() - start_time),
+            "files": file_count,
+            "users": {
+                "total": user_count,
+                "active_7d": active_7d,
+                "active_30d": active_30d,
+                "new_7d": new_7d
+            },
+            "channels": {
+                "channel1": CHANNEL_1 or None,
+                "channel2": CHANNEL_2 or None
+            },
+            "config": {
+                "delete_after": DELETE_AFTER,
+                "webhook": WEBHOOK_URL
+            }
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ---------- Graceful shutdown ----------
+def _term_handler(signum, frame):
+    """Handle termination signals"""
+    log.info(f"Signal {signum} received — shutting down")
+    
+    # Stop application if running
+    with suppress(Exception):
+        if bot_loop and application:
+            fut = asyncio.run_coroutine_threadsafe(application.stop(), bot_loop)
+            fut.result(timeout=10)
+    
+    # Exit process
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, _term_handler)
+signal.signal(signal.SIGINT, _term_handler)
+
+# ---------- Main ----------
+def main():
+    """Main entry point"""
+    log.info("Starting Telegram File Bot...")
+    
+    # Log configuration
+    log.info(f"BOT_USERNAME: {BOT_USERNAME}")
+    log.info(f"DELETE_AFTER: {DELETE_AFTER} seconds")
+    log.info(f"CHANNEL_1: {CHANNEL_1 if CHANNEL_1 else 'Not set'}")
+    log.info(f"CHANNEL_2: {CHANNEL_2 if CHANNEL_2 else 'Not set'}")
+    
+    # Start bot thread
+    start_bot_in_thread()
+    
+    # Start Flask server
+    log.info(f"Starting Flask server on 0.0.0.0:{PORT}")
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
