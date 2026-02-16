@@ -625,36 +625,37 @@ async def check_channels_membership(bot, user_id: int) -> Tuple[bool, List[str]]
     if CHANNEL_1:
         is_member = await check_user_in_channel(bot, CHANNEL_1, user_id)
         if not is_member:
-            missing_channels.append(f"@{CHANNEL_1}")
+            missing_channels.append(CHANNEL_1)
     
     if CHANNEL_2:
         is_member = await check_user_in_channel(bot, CHANNEL_2, user_id)
         if not is_member:
-            missing_channels.append(f"@{CHANNEL_2}")
+            missing_channels.append(CHANNEL_2)
     
     return len(missing_channels) == 0, missing_channels
 
 def get_membership_keyboard(missing_channels: List[str], file_key: str = None) -> InlineKeyboardMarkup:
-    """Create keyboard for missing channels"""
+    """Create keyboard for missing channels - with proper buttons"""
     keyboard = []
     
+    # Add join buttons for each missing channel
     for channel in missing_channels:
-        ch = channel if channel.startswith("@") else f"@{channel}"
-        display_ch = ch[1:] if ch.startswith("@") else ch
+        clean_channel = channel.replace("@", "")
         keyboard.append([
             InlineKeyboardButton(
-                f"📢 Join {display_ch}", 
-                url=f"https://t.me/{display_ch}"
+                f"📢 Join @{clean_channel}", 
+                url=f"https://t.me/{clean_channel}"
             )
         ])
     
+    # Add check button
     if file_key:
         keyboard.append([
-            InlineKeyboardButton("✅ I've Joined", callback_data=f"check_{file_key}")
+            InlineKeyboardButton("✅ Check Again", callback_data=f"check_{file_key}")
         ])
     else:
         keyboard.append([
-            InlineKeyboardButton("✅ I've Joined", callback_data="check_membership")
+            InlineKeyboardButton("✅ Check Again", callback_data="check_membership")
         ])
     
     return InlineKeyboardMarkup(keyboard)
@@ -684,19 +685,9 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_key = args[0] if args else None
             keyboard = get_membership_keyboard(missing, file_key)
             
-            channel_names = []
-            if CHANNEL_1:
-                channel_names.append(f"@{CHANNEL_1}")
-            if CHANNEL_2:
-                channel_names.append(f"@{CHANNEL_2}")
-            
-            channels_text = " & ".join(channel_names)
-            
             sent = await update.message.reply_text(
-                f"🔒 **Access Restricted**\n\n"
-                f"To use this bot, you must join our channel{'s' if len(channel_names) > 1 else ''} first:\n"
-                f"{channels_text}\n\n"
-                f"Please join and click the button below:",
+                "🔒 **Access Restricted**\n\n"
+                "To access files, please join our channels:",
                 reply_markup=keyboard,
                 parse_mode=ParseMode.MARKDOWN
             )
@@ -732,7 +723,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_member:
             keyboard = get_membership_keyboard(missing, key)
             sent = await update.message.reply_text(
-                "🔒 You still need to join our channels to access this file:",
+                "🔒 Please join our channels to access this file:",
                 reply_markup=keyboard
             )
             await schedule_message_deletion(context, sent.chat_id, sent.message_id)
@@ -841,7 +832,10 @@ async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔗 **Share Link:**\n`{link}`\n\n"
         f"**Commands:**\n"
         f"• /listfiles - View all files\n"
-        f"• /deletefile {key} - Delete this file"
+        f"• /deletefile {key} - Delete this file\n"
+        f"• /stats - Bot statistics\n"
+        f"• /users - User list\n"
+        f"• /broadcast - Send message to all users"
     )
     
     sent = await msg.reply_text(response, parse_mode=ParseMode.MARKDOWN)
@@ -850,6 +844,7 @@ async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def listfiles_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all files (admin only)"""
     if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ You are not authorized to use this command.")
         return
     
     rows = await db.get_all_files(limit=100)
@@ -884,6 +879,7 @@ async def listfiles_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def deletefile_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Delete a file (admin only)"""
     if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ You are not authorized to use this command.")
         return
     
     if not context.args:
@@ -904,6 +900,7 @@ async def deletefile_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show bot statistics (admin only)"""
     if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ You are not authorized to use this command.")
         return
     
     uptime = str(timedelta(seconds=int(time.time() - start_time)))
@@ -940,6 +937,7 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Broadcast message to all users (admin only)"""
     if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ You are not authorized to use this command.")
         return
     
     if not context.args and not update.message.reply_to_message:
@@ -1011,6 +1009,7 @@ async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def users_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show user list (admin only)"""
     if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ You are not authorized to use this command.")
         return
     
     total_users = await db.get_user_count()
@@ -1061,14 +1060,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if is_member:
             await query.edit_message_text(
-                "✅ Thank you for joining! You can now access files.\n"
-                "Send /start to begin."
+                "✅ **Success!**\n\nYou now have access to all files.\n\nSend /start to continue.",
+                parse_mode=ParseMode.MARKDOWN
             )
         else:
             keyboard = get_membership_keyboard(missing)
             await query.edit_message_text(
-                "🔒 You still need to join these channels:",
-                reply_markup=keyboard
+                "❌ **Not a member yet**\n\nPlease join these channels first:",
+                reply_markup=keyboard,
+                parse_mode=ParseMode.MARKDOWN
             )
     
     elif data.startswith("check_"):
@@ -1085,8 +1085,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_member:
             keyboard = get_membership_keyboard(missing, file_key)
             await query.edit_message_text(
-                "🔒 You still need to join these channels:",
-                reply_markup=keyboard
+                "❌ **Not a member yet**\n\nPlease join these channels first:",
+                reply_markup=keyboard,
+                parse_mode=ParseMode.MARKDOWN
             )
             return
         
@@ -1395,14 +1396,7 @@ async def start_bot():
     BOT_USERNAME = bot_info.username
     log.info(f"Bot username: @{BOT_USERNAME}")
     
-    # Try to set webhook if URL is available
-    if RENDER_EXTERNAL_URL:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-        await application.bot.set_webhook(url=WEBHOOK_URL)
-        log.info(f"Webhook set: {WEBHOOK_URL}")
-    else:
-        log.warning("RENDER_EXTERNAL_URL not set, webhook not configured")
-    
+    # Add all handlers
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(CommandHandler("upload", upload_handler))
     application.add_handler(CommandHandler("listfiles", listfiles_handler))
@@ -1413,6 +1407,7 @@ async def start_bot():
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_error_handler(error_handler)
     
+    # File upload handler for admin
     upload_filter = filters.VIDEO | filters.Document.ALL
     application.add_handler(
         MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload_handler)
@@ -1420,6 +1415,17 @@ async def start_bot():
     
     await application.initialize()
     await application.start()
+    
+    # Try to set webhook if URL is available
+    if RENDER_EXTERNAL_URL:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        await application.bot.set_webhook(url=WEBHOOK_URL)
+        log.info(f"Webhook set: {WEBHOOK_URL}")
+    else:
+        log.warning("RENDER_EXTERNAL_URL not set, webhook not configured")
+        # Start polling as fallback
+        log.info("Starting polling...")
+        await application.updater.start_polling()
     
     log.info("Bot is running")
     
@@ -1438,7 +1444,7 @@ def main():
     log.info(f"Bot Token: {BOT_TOKEN[:10]}...")
     log.info(f"Admin ID: {ADMIN_ID}")
     log.info(f"Database: {DATABASE_URL[:20]}...")
-    log.info(f"Webhook URL: {WEBHOOK_URL or 'Not set (will auto-detect)'}")
+    log.info(f"Webhook URL: {WEBHOOK_URL or 'Not set (will use polling)'}")
     log.info(f"Channel 1: {CHANNEL_1 or 'Not set'}")
     log.info(f"Channel 2: {CHANNEL_2 or 'Not set'}")
     log.info("=" * 50)
