@@ -1363,18 +1363,18 @@ def ping():
 async def run_bot():
     """Run the bot with polling"""
     global application, db
-    
+
     log.info("Starting bot with polling mode...")
-    
+
     # Initialize database
     await db.ensure_database()
     await db.init_db()
     log.info("Database ready")
-    
+
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Add handlers
+
+    # Add command handlers
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(CommandHandler("listfiles", listfiles_handler))
     application.add_handler(CommandHandler("deletefile", deletefile_handler))
@@ -1383,30 +1383,24 @@ async def run_bot():
     application.add_handler(CommandHandler("users", users_handler))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_error_handler(error_handler)
-    
-    # IMPORTANT FIX: File upload handler for admin - capture ALL file types
-    # This catches any document or video sent by admin in private chat
-    upload_filter = filters.VIDEO | filters.Document.ALL | filters.AUDIO | filters.PHOTO
+
+    # File upload handler for admin (ALL file types)
+    upload_filter = (
+        filters.VIDEO |
+        filters.Document.ALL |
+        filters.AUDIO |
+        filters.PHOTO
+    )
+
     application.add_handler(
-        MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload_handler)
+        MessageHandler(
+            upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE,
+            upload_handler
+        )
     )
-    
-    # Also add a catch-all for any other message types that might contain files
-    # This ensures we don't miss anything
-    # application.add_handler(
-    #     MessageHandler(filters.ALL & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload_handler)
-    # )
-    upload_filter = filters.VIDEO | filters.Document.ALL
 
-application.add_handler(
-    MessageHandler(
-        upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE,
-        upload_handler
-    )
-)
+    log.info("Handlers registered successfully")
 
-       log.info("Handlers registered successfully")
-    
     # Start polling
     log.info("Starting polling...")
 
