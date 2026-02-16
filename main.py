@@ -1393,26 +1393,27 @@ async def run_bot():
     
     # Also add a catch-all for any other message types that might contain files
     # This ensures we don't miss anything
-    application.add_handler(
-        MessageHandler(filters.ALL & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload_handler)
+    # application.add_handler(
+    #     MessageHandler(filters.ALL & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload_handler)
+    # )
+    upload_filter = filters.VIDEO | filters.Document.ALL
+
+application.add_handler(
+    MessageHandler(
+        upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE,
+        upload_handler
     )
-    
-    log.info("Handlers registered successfully")
+)
+
+       log.info("Handlers registered successfully")
     
     # Start polling
     log.info("Starting polling...")
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling(
+
+    await application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True
     )
-    
-    log.info("Bot is running with polling")
-    
-    # Keep running
-    while True:
-        await asyncio.sleep(3600)
 
 def run_flask():
     """Run Flask in a separate thread"""
