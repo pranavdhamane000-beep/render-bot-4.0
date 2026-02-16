@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram File Bot — Complete version with all features
+Telegram File Bot — Complete version with polling only
 Compatible with Python 3.14.3, python-telegram-bot >=21.7, Flask >=2.3.3, pg8000 >=1.30.5
 """
 
@@ -12,11 +12,8 @@ import logging
 import threading
 import asyncio
 import urllib.parse
-import signal
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
-from contextlib import suppress
-from collections import defaultdict
 
 import pg8000
 from flask import Flask, request, jsonify, render_template_string
@@ -45,11 +42,7 @@ log.setLevel(logging.INFO)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
-WEBHOOK_PATH = "/telegram-webhook"
-WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}" if RENDER_EXTERNAL_URL else ""
 PORT = int(os.environ.get("PORT", "5000"))
-BOT_USERNAME = os.environ.get("BOT_USERNAME", "")
 
 # Channel settings
 CHANNEL_1 = os.environ.get("CHANNEL_1", "").strip().replace("@", "")
@@ -66,7 +59,7 @@ if not (BOT_TOKEN and ADMIN_ID and DATABASE_URL):
     log.error("Missing one of required env vars: BOT_TOKEN, ADMIN_ID, DATABASE_URL")
     sys.exit(1)
 
-# ---------- Flask app ----------
+# ---------- Flask app (optional dashboard) ----------
 app = Flask(__name__)
 start_time = time.time()
 
@@ -565,7 +558,6 @@ db = Database(DATABASE_URL)
 
 # ---------- Bot & handlers ----------
 application: Optional[Application] = None
-bot_loop: Optional[asyncio.AbstractEventLoop] = None
 
 async def _delete_job(context: ContextTypes.DEFAULT_TYPE):
     """Job to delete messages"""
@@ -810,17 +802,12 @@ async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     key = await db.save_file(fid, file_info)
     
-    # Get bot username if not set
-    global BOT_USERNAME
-    if not BOT_USERNAME and context.bot:
-        bot_info = await context.bot.get_me()
-        BOT_USERNAME = bot_info.username
+    # Get bot username
+    bot_info = await context.bot.get_me()
+    bot_username = bot_info.username
     
     # Create the shareable link
-    if BOT_USERNAME:
-        link = f"https://t.me/{BOT_USERNAME}?start={key}"
-    else:
-        link = f"Use this key: {key}"
+    link = f"https://t.me/{bot_username}?start={key}"
     
     size_mb = size / (1024 * 1024)
     
@@ -1138,30 +1125,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors"""
     log.error(f"Update {update} caused error {context.error}")
 
-# ---------- Flask routes ----------
-@app.route(WEBHOOK_PATH, methods=["POST"])
-def telegram_webhook():
-    """Handle Telegram webhook"""
-    global application
-    
-    if application is None:
-        return "Bot not ready", 503
-    
-    try:
-        data = request.get_json(force=True)
-        update = Update.de_json(data, application.bot)
-        
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(application.process_update(update))
-        loop.close()
-        
-        return "ok", 200
-        
-    except Exception as e:
-        log.exception(f"Webhook error: {e}")
-        return "error", 500
-
+# ---------- Flask routes (optional dashboard) ----------
 @app.route("/", methods=["GET"])
 def home():
     """Web dashboard"""
@@ -1181,13 +1145,6 @@ def home():
                 conn.close()
     except Exception as e:
         log.error(f"Error getting stats: {e}")
-    
-    # Auto-detect external URL from request if not set
-    global RENDER_EXTERNAL_URL, WEBHOOK_URL
-    if not RENDER_EXTERNAL_URL and request.headers.get('Host'):
-        scheme = 'https' if request.headers.get('X-Forwarded-Proto', 'http') == 'https' else 'http'
-        RENDER_EXTERNAL_URL = f"{scheme}://{request.headers['Host']}"
-        WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
     
     html = """
     <!DOCTYPE html>
@@ -1306,13 +1263,8 @@ def home():
                 </div>
                 
                 <div class="info-row">
-                    <span class="info-label">Bot Status</span>
-                    <span class="info-value"><span class="badge badge-success">✅ Active</span></span>
-                </div>
-                
-                <div class="info-row">
-                    <span class="info-label">Webhook URL</span>
-                    <span class="info-value"><code>{{ webhook }}</code></span>
+                    <span class="info-label">Bot Mode</span>
+                    <span class="info-value"><span class="badge badge-success">✅ Polling</span></span>
                 </div>
                 
                 <div class="info-row">
@@ -1333,13 +1285,21 @@ def home():
     </html>
     """
     
+    # Get bot username for dashboard
+    bot_username = "your_bot"
+    if application and application.bot:
+        try:
+            bot_info = asyncio.run(application.bot.get_me())
+            bot_username = bot_info.username
+        except:
+            pass
+    
     return render_template_string(
         html, 
         uptime=uptime, 
         files=file_count, 
-        users=user_count, 
-        webhook=WEBHOOK_URL,
-        bot_username=BOT_USERNAME
+        users=user_count,
+        bot_username=bot_username
     )
 
 @app.route("/health", methods=["GET"])
@@ -1364,7 +1324,7 @@ def health():
     return jsonify({
         "status": "ok",
         "uptime_seconds": int(time.time() - start_time),
-        "webhook": WEBHOOK_URL,
+        "mode": "polling",
         "db_initialized": db.initialized,
         "file_count": file_count,
         "user_count": user_count,
@@ -1380,23 +1340,21 @@ def ping():
     return "pong", 200
 
 # ---------- Bot startup ----------
-async def start_bot():
-    """Start the bot"""
-    global application, db, BOT_USERNAME, WEBHOOK_URL, RENDER_EXTERNAL_URL
+async def run_bot():
+    """Run the bot with polling"""
+    global application, db
     
-    log.info("Starting bot initialization...")
+    log.info("Starting bot with polling mode...")
     
+    # Initialize database
     await db.ensure_database()
     await db.init_db()
     log.info("Database ready")
     
+    # Create application
     application = Application.builder().token(BOT_TOKEN).build()
     
-    bot_info = await application.bot.get_me()
-    BOT_USERNAME = bot_info.username
-    log.info(f"Bot username: @{BOT_USERNAME}")
-    
-    # Add all handlers
+    # Add handlers
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(CommandHandler("upload", upload_handler))
     application.add_handler(CommandHandler("listfiles", listfiles_handler))
@@ -1413,47 +1371,44 @@ async def start_bot():
         MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload_handler)
     )
     
+    # Start polling
+    log.info("Starting polling...")
     await application.initialize()
     await application.start()
+    await application.updater.start_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
+    )
     
-    # Try to set webhook if URL is available
-    if RENDER_EXTERNAL_URL:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-        await application.bot.set_webhook(url=WEBHOOK_URL)
-        log.info(f"Webhook set: {WEBHOOK_URL}")
-    else:
-        log.warning("RENDER_EXTERNAL_URL not set, webhook not configured")
-        # Start polling as fallback
-        log.info("Starting polling...")
-        await application.updater.start_polling()
+    log.info("Bot is running with polling")
     
-    log.info("Bot is running")
-    
+    # Keep running
     while True:
         await asyncio.sleep(3600)
 
 def run_flask():
     """Run Flask in a separate thread"""
-    log.info(f"Starting Flask on port {PORT}")
+    log.info(f"Starting Flask dashboard on port {PORT}")
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 def main():
     """Main function"""
     log.info("=" * 50)
-    log.info("Starting Telegram File Bot")
+    log.info("Starting Telegram File Bot (Polling Mode)")
     log.info(f"Bot Token: {BOT_TOKEN[:10]}...")
     log.info(f"Admin ID: {ADMIN_ID}")
     log.info(f"Database: {DATABASE_URL[:20]}...")
-    log.info(f"Webhook URL: {WEBHOOK_URL or 'Not set (will use polling)'}")
     log.info(f"Channel 1: {CHANNEL_1 or 'Not set'}")
     log.info(f"Channel 2: {CHANNEL_2 or 'Not set'}")
     log.info("=" * 50)
     
+    # Start Flask in a separate thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
+    # Run bot with polling
     try:
-        asyncio.run(start_bot())
+        asyncio.run(run_bot())
     except KeyboardInterrupt:
         log.info("Bot stopped by user")
     except Exception as e:
