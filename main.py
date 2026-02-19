@@ -59,7 +59,8 @@ if not DATABASE_URL:
 
 DELETE_AFTER = 600  # 10 minutes
 MAX_STORED_FILES = 10000
-AUTO_CLEANUP_DAYS = 0  # NEVER auto-cleanup
+# REMOVED AUTO CLEANUP - Set to 0 (disabled)
+AUTO_CLEANUP_DAYS = 0  # DISABLED - No auto cleanup
 
 # Playable formats
 PLAYABLE_EXTS = {"mp4", "mov", "m4v", "mpeg", "mpg"}
@@ -68,6 +69,17 @@ PLAYABLE_EXTS = {"mp4", "mov", "m4v", "mpeg", "mpg"}
 ALL_VIDEO_EXTS = {
     "mp4", "mkv", "mov", "avi", "webm", "flv", "m4v",
     "3gp", "wmv", "mpg", "mpeg"
+}
+
+# Friendly channel names (for UI) - You can customize these!
+CHANNEL_NAMES = {
+    # Add friendly names for your channels here
+    # Format: "channel_username": "Display Name"
+    "A_Knight_of_the_Seven_Kingdoms_t": "Channel 1",
+    "A_Knight_of_the_Seven_Kingdoms_r": "Main Channel",
+    "A_Knight_of_the_Seven_Kingdoms_y": "Backup Channel",
+    "your_movies_web": "Movies Channel",
+    # Add more as needed
 }
 
 # =========================================
@@ -192,7 +204,7 @@ class Database:
             )
         ''')
         
-        # ============ NEW: Channels table for dynamic membership checking ============
+        # Required channels table
         cur.execute('''
             CREATE TABLE IF NOT EXISTS required_channels (
                 id SERIAL PRIMARY KEY,
@@ -220,12 +232,14 @@ class Database:
         if count == 0 and DEFAULT_CHANNELS:
             for i, channel in enumerate(DEFAULT_CHANNELS):
                 if channel:  # Only if not empty
+                    # Get friendly name from dictionary or use default
+                    friendly_name = CHANNEL_NAMES.get(channel, f"Channel {i+1}")
                     cur.execute('''
                         INSERT INTO required_channels (channel_username, channel_name, position, is_active)
                         VALUES (%s, %s, %s, 1)
                         ON CONFLICT (channel_username) DO NOTHING
-                    ''', (channel, f"Channel {i+1}", i))
-                    log.info(f"Added default channel: {channel}")
+                    ''', (channel, friendly_name, i))
+                    log.info(f"Added default channel: {channel} as '{friendly_name}'")
         
         conn.commit()
 
@@ -276,7 +290,52 @@ class Database:
                     return cur.rowcount
             return await asyncio.to_thread(_execute)
 
-    # ============ NEW: Channel management methods ============
+    # ============ NEW: Get database storage usage ============
+    async def get_db_storage_usage(self) -> Dict[str, Any]:
+        """Get PostgreSQL database storage usage"""
+        try:
+            # Query to get database size
+            result = await self.fetchrow('''
+                SELECT 
+                    pg_database_size(current_database()) as total_bytes,
+                    (SELECT COALESCE(SUM(pg_total_relation_size(relid)), 0) 
+                     FROM pg_stat_user_tables) as table_bytes,
+                    (SELECT COALESCE(SUM(pg_indexes_size(relid)), 0) 
+                     FROM pg_stat_user_tables) as index_bytes
+            ''')
+            
+            if result:
+                total_bytes = result['total_bytes'] or 0
+                table_bytes = result['table_bytes'] or 0
+                index_bytes = result['index_bytes'] or 0
+                
+                # Convert to human readable format
+                def format_bytes(bytes_val):
+                    for unit in ['B', 'KB', 'MB', 'GB']:
+                        if bytes_val < 1024.0:
+                            return f"{bytes_val:.2f} {unit}"
+                        bytes_val /= 1024.0
+                    return f"{bytes_val:.2f} TB"
+                
+                return {
+                    'total': format_bytes(total_bytes),
+                    'total_bytes': total_bytes,
+                    'tables': format_bytes(table_bytes),
+                    'indexes': format_bytes(index_bytes),
+                    'tables_bytes': table_bytes,
+                    'indexes_bytes': index_bytes
+                }
+        except Exception as e:
+            log.error(f"Error getting DB storage: {e}")
+        
+        return {
+            'total': 'Unknown',
+            'total_bytes': 0,
+            'tables': 'Unknown',
+            'indexes': 'Unknown'
+        }
+
+    # ============ Channel management methods ============
     async def get_required_channels(self, active_only: bool = True) -> List[str]:
         """Get list of all required channels"""
         if active_only:
@@ -303,6 +362,9 @@ class Database:
         if not clean_username:
             return False
         
+        # Use friendly name from dictionary if available
+        friendly_name = channel_name or CHANNEL_NAMES.get(clean_username, clean_username)
+        
         # Get max position for new channel
         result = await self.fetchrow("SELECT COALESCE(MAX(position), -1) + 1 as next_pos FROM required_channels")
         next_pos = result['next_pos'] if result else 0
@@ -315,9 +377,9 @@ class Database:
                 SET is_active = 1,
                     added_by = EXCLUDED.added_by,
                     channel_name = COALESCE(EXCLUDED.channel_name, required_channels.channel_name)
-            ''', (clean_username, channel_name or clean_username, added_by, next_pos))
+            ''', (clean_username, friendly_name, added_by, next_pos))
             
-            log.info(f"Channel added: @{clean_username} by user {added_by}")
+            log.info(f"Channel added: @{clean_username} as '{friendly_name}' by user {added_by}")
             return True
         except Exception as e:
             log.error(f"Error adding channel: {e}")
@@ -340,35 +402,16 @@ class Database:
             return True
         return False
     
-    async def delete_channel_permanently(self, channel_username: str) -> bool:
-        """Permanently delete a channel from database"""
+    async def update_channel_name(self, channel_username: str, new_name: str) -> bool:
+        """Update friendly name for a channel"""
         clean_username = channel_username.replace("@", "").strip()
         
-        # Clear cache first
-        await self.execute_and_commit("DELETE FROM membership_cache WHERE channel = %s", (clean_username,))
-        
         rowcount = await self.execute_and_commit('''
-            DELETE FROM required_channels WHERE channel_username = %s
-        ''', (clean_username,))
+            UPDATE required_channels SET channel_name = %s
+            WHERE channel_username = %s
+        ''', (new_name, clean_username))
         
-        if rowcount > 0:
-            log.info(f"Channel permanently deleted: @{clean_username}")
-            return True
-        return False
-    
-    async def reorder_channels(self, channel_order: List[str]) -> bool:
-        """Reorder channels (admin only)"""
-        try:
-            for i, channel in enumerate(channel_order):
-                clean = channel.replace("@", "")
-                await self.execute_and_commit('''
-                    UPDATE required_channels SET position = %s
-                    WHERE channel_username = %s
-                ''', (i, clean))
-            return True
-        except Exception as e:
-            log.error(f"Error reordering channels: {e}")
-            return False
+        return rowcount > 0
     
     async def get_channel_count(self) -> int:
         """Get number of active required channels"""
@@ -490,6 +533,11 @@ class Database:
         ''')
         # Return as list of tuples for compatibility with original code
         return [(row['id'], row['file_name'], row['is_video'], row['file_size'], row['timestamp'], row['access_count']) for row in rows]
+
+    async def get_total_storage_used(self) -> int:
+        """Get total storage used by files in bytes"""
+        result = await self.fetchrow("SELECT COALESCE(SUM(file_size), 0) as total FROM files")
+        return result['total'] if result else 0
 
     async def schedule_message_deletion(self, chat_id: int, message_id: int):
         """Schedule a message for deletion."""
@@ -757,13 +805,15 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
     result = {
         "all_joined": False,
         "missing_channels": [],
+        "missing_channel_names": [],
         "channel_status": {}
     }
 
-    # Get all active required channels
-    channels = await db.get_required_channels(active_only=True)
+    # Get all active required channels with details
+    channels_data = await db.get_channels_with_details()
+    active_channels = [c for c in channels_data if c['is_active'] == 1]
     
-    if not channels:
+    if not active_channels:
         # No channels required - auto approve
         result["all_joined"] = True
         return result
@@ -772,12 +822,19 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
         await db.clear_membership_cache(user_id)
 
     # Check each channel
-    for channel in channels:
+    for channel_data in active_channels:
+        channel = channel_data['channel_username']
+        channel_name = channel_data['channel_name'] or channel
+        
         is_member = await check_user_in_channel(bot, channel, user_id, force_check)
-        result["channel_status"][f"@{channel}"] = is_member
+        result["channel_status"][channel] = {
+            'is_member': is_member,
+            'name': channel_name
+        }
         
         if not is_member:
-            result["missing_channels"].append(f"@{channel}")
+            result["missing_channels"].append(channel)
+            result["missing_channel_names"].append(channel_name)
 
     result["all_joined"] = len(result["missing_channels"]) == 0
     return result
@@ -863,7 +920,7 @@ def home():
             <p>Files in DB: {{ file_count }}</p>
             <p>Users in DB: {{ user_count }}</p>
             <p>Required Channels: {{ channel_count }}</p>
-            <p>📁 Storage: PERMANENT PostgreSQL</p>
+            <p>📁 Storage: PERMANENT (No auto cleanup)</p>
         </div>
 
         <div class="info">
@@ -872,7 +929,7 @@ def home():
                 <li>Bot: <strong>@{{ bot_username }}</strong></li>
                 <li>Database: <strong>Render PostgreSQL</strong></li>
                 <li>Driver: <strong>psycopg2-binary</strong></li>
-                <li>Storage: <strong>PERMANENT</strong></li>
+                <li>Storage: <strong>PERMANENT - No auto cleanup</strong></li>
                 <li>Message Auto-delete: <strong>{{ delete_minutes }} minutes</strong></li>
                 <li>Dynamic Channels: <strong>Yes (Add/Remove anytime)</strong></li>
             </ul>
@@ -936,6 +993,7 @@ def health():
         "database": "postgresql",
         "driver": "psycopg2-binary",
         "storage": "permanent",
+        "auto_cleanup": False,
         "file_count": file_count,
         "user_count": user_count,
         "channel_count": channel_count,
@@ -1026,17 +1084,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             last_name=user.last_name
         )
 
-        # Get required channels for display
-        channels = await db.get_required_channels(active_only=True)
+        # Get required channels with details
+        channels_data = await db.get_channels_with_details()
+        active_channels = [c for c in channels_data if c['is_active'] == 1]
         
         # No file key - show welcome
         if not args:
             keyboard = []
             
-            # Add buttons for each required channel
-            for channel in channels:
+            # Add buttons for each required channel with friendly names
+            for channel_data in active_channels:
+                channel = channel_data['channel_username']
+                channel_name = channel_data['channel_name'] or f"Channel"
                 keyboard.append([InlineKeyboardButton(
-                    f"📢 Join @{channel}", 
+                    f"📢 Join {channel_name}", 
                     url=f"https://t.me/{channel}"
                 )])
             
@@ -1046,21 +1107,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 callback_data="check_membership"
             )])
 
-            channel_text = ""
-            if channels:
-                channel_text = "\n".join([f"{i+1}. Join @{ch}" for i, ch in enumerate(channels)])
+            if active_channels:
+                channel_list = "\n".join([f"{i+1}. {c['channel_name'] or f'Channel {i+1}'}" for i, c in enumerate(active_channels)])
             else:
-                channel_text = "No channels required!"
+                channel_list = "No channels required!"
 
             sent_msg = await update.message.reply_text(
                 "🤖 *Welcome to File Sharing Bot*\n\n"
                 "🔗 *How to use:*\n"
                 "1️⃣ Use admin-provided links\n"
                 "2️⃣ Join the required channels:\n"
-                f"{channel_text}\n"
+                f"{channel_list}\n"
                 "3️⃣ Click 'Check Membership'\n\n"
                 f"⚠️ Messages auto-delete after {DELETE_AFTER//60} minutes\n"
-                "💾 *Storage:* PERMANENT PostgreSQL\n"
+                "💾 *Storage:* PERMANENT (No auto cleanup)\n"
                 "📢 *Dynamic Channels:* Add/remove anytime by admin",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
@@ -1081,15 +1141,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await check_membership(user_id, context, force_check=True)
 
         if not result["all_joined"]:
-            missing_channels = result["missing_channels"]
+            missing_names = result["missing_channel_names"]
             keyboard = []
             
-            # Add buttons for missing channels
-            for channel in missing_channels:
-                clean_channel = channel.replace("@", "")
+            # Add buttons for missing channels with friendly names
+            for i, channel in enumerate(result["missing_channels"]):
+                channel_name = missing_names[i] if i < len(missing_names) else f"Channel"
                 keyboard.append([InlineKeyboardButton(
-                    f"📥 Join {channel}", 
-                    url=f"https://t.me/{clean_channel}"
+                    f"📥 Join {channel_name}", 
+                    url=f"https://t.me/{channel}"
                 )])
             
             # Add check again button
@@ -1098,8 +1158,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 callback_data=f"check|{key}"
             )])
             
-            if len(missing_channels) == 1:
-                text = f"🔒 *Join {missing_channels[0]} to access this file*"
+            if len(missing_names) == 1:
+                text = f"🔒 *Join {missing_names[0]} to access this file*"
             else:
                 text = "🔒 *Join all required channels to access this file*"
 
@@ -1118,7 +1178,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filename = file_info['file_name']
             ext = filename.lower().split('.')[-1] if '.' in filename else ""
 
-            warning = f"\n\n⚠️ Auto-deletes in {DELETE_AFTER//60} minutes\n💾 Permanently stored"
+            warning = f"\n\n⚠️ Auto-deletes in {DELETE_AFTER//60} minutes\n💾 Permanently stored (no auto cleanup)"
 
             if file_info['is_video'] and ext in PLAYABLE_EXTS:
                 sent = await context.bot.send_video(
@@ -1168,9 +1228,11 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result = await check_membership(user_id, context, force_check=True)
 
             if result["all_joined"]:
-                # Get channels for display
-                channels = await db.get_required_channels(active_only=True)
-                channel_list = "\n".join([f"✅ @{ch}" for ch in channels])
+                # Get channels with details
+                channels_data = await db.get_channels_with_details()
+                active_channels = [c for c in channels_data if c['is_active'] == 1]
+                
+                channel_list = "\n".join([f"✅ {c['channel_name'] or f'Channel {i+1}'}" for i, c in enumerate(active_channels)])
                 
                 await query.edit_message_text(
                     f"✅ *You've joined all required channels!*\n\n"
@@ -1179,15 +1241,16 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown"
                 )
             else:
+                missing_names = result["missing_channel_names"]
                 missing_channels = result["missing_channels"]
                 keyboard = []
                 
-                # Add buttons for missing channels
-                for channel in missing_channels:
-                    clean_channel = channel.replace("@", "")
+                # Add buttons for missing channels with friendly names
+                for i, channel in enumerate(missing_channels):
+                    channel_name = missing_names[i] if i < len(missing_names) else f"Channel"
                     keyboard.append([InlineKeyboardButton(
-                        f"📥 Join {channel}", 
-                        url=f"https://t.me/{clean_channel}"
+                        f"📥 Join {channel_name}", 
+                        url=f"https://t.me/{channel}"
                     )])
                 
                 # Add check again button
@@ -1196,8 +1259,8 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     callback_data="check_membership"
                 )])
                 
-                if len(missing_channels) == 1:
-                    text = f"❌ *Missing {missing_channels[0]}*"
+                if len(missing_names) == 1:
+                    text = f"❌ *Missing {missing_names[0]}*"
                 else:
                     text = "❌ *Not a member of required channels*"
 
@@ -1219,15 +1282,16 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result = await check_membership(user_id, context, force_check=True)
 
             if not result['all_joined']:
+                missing_names = result["missing_channel_names"]
                 missing_channels = result["missing_channels"]
                 keyboard = []
                 
-                # Add buttons for missing channels
-                for channel in missing_channels:
-                    clean_channel = channel.replace("@", "")
+                # Add buttons for missing channels with friendly names
+                for i, channel in enumerate(missing_channels):
+                    channel_name = missing_names[i] if i < len(missing_names) else f"Channel"
                     keyboard.append([InlineKeyboardButton(
-                        f"📥 Join {channel}", 
-                        url=f"https://t.me/{clean_channel}"
+                        f"📥 Join {channel_name}", 
+                        url=f"https://t.me/{channel}"
                     )])
                 
                 # Add check again button
@@ -1236,8 +1300,8 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     callback_data=f"check|{key}"
                 )])
                 
-                if len(missing_channels) == 1:
-                    text = f"❌ *Join {missing_channels[0]}*"
+                if len(missing_names) == 1:
+                    text = f"❌ *Join {missing_names[0]}*"
                 else:
                     text = "❌ *Join all required channels*"
 
@@ -1255,7 +1319,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 filename = file_info['file_name']
                 ext = filename.lower().split('.')[-1] if '.' in filename else ""
 
-                warning = f"\n\n⚠️ Auto-deletes in {DELETE_AFTER//60} minutes\n💾 Permanently stored"
+                warning = f"\n\n⚠️ Auto-deletes in {DELETE_AFTER//60} minutes\n💾 Permanently stored (no auto cleanup)"
                 chat_id = query.message.chat_id
 
                 if file_info['is_video'] and ext in PLAYABLE_EXTS:
@@ -1284,7 +1348,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error(f"Callback error: {e}", exc_info=True)
 
-# ============ NEW CHANNEL MANAGEMENT COMMANDS ============
+# ============ CHANNEL MANAGEMENT COMMANDS ============
 async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add a new required channel (admin only)"""
     if update.effective_user.id != ADMIN_ID:
@@ -1292,13 +1356,19 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not context.args:
         sent_msg = await update.message.reply_text(
-            "❌ Usage: /addchannel <channel username>\n"
-            "Example: /addchannel @my_channel"
+            "❌ Usage: /addchannel <channel username> [friendly name]\n"
+            "Example: /addchannel @my_channel \"My Awesome Channel\""
         )
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
 
     channel = context.args[0]
+    friendly_name = None
+    
+    # Check if friendly name provided
+    if len(context.args) > 1:
+        friendly_name = " ".join(context.args[1:])
+    
     user_id = update.effective_user.id
     
     # Try to verify bot is admin in the channel
@@ -1328,15 +1398,16 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Continue anyway - maybe channel exists but bot not added yet
 
     # Add channel to database
-    success = await db.add_channel(channel, user_id)
+    success = await db.add_channel(channel, user_id, friendly_name)
     
     if success:
-        channels = await db.get_required_channels(active_only=True)
-        channel_list = "\n".join([f"{i+1}. @{ch}" for i, ch in enumerate(channels)])
+        channels = await db.get_channels_with_details()
+        active_channels = [c for c in channels if c['is_active'] == 1]
+        channel_list = "\n".join([f"{i+1}. {c['channel_name'] or c['channel_username']}" for i, c in enumerate(active_channels)])
         
         sent_msg = await update.message.reply_text(
             f"✅ *Channel added successfully!*\n\n"
-            f"Added: @{channel.replace('@', '')}\n\n"
+            f"Added: {friendly_name or f'@{channel.replace("@", "")}'}\n\n"
             f"📋 *Current required channels:*\n{channel_list}",
             parse_mode="Markdown"
         )
@@ -1365,9 +1436,11 @@ async def removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success = await db.remove_channel(channel)
     
     if success:
-        channels = await db.get_required_channels(active_only=True)
-        if channels:
-            channel_list = "\n".join([f"{i+1}. @{ch}" for i, ch in enumerate(channels)])
+        channels = await db.get_channels_with_details()
+        active_channels = [c for c in channels if c['is_active'] == 1]
+        
+        if active_channels:
+            channel_list = "\n".join([f"{i+1}. {c['channel_name'] or c['channel_username']}" for i, c in enumerate(active_channels)])
         else:
             channel_list = "No channels required (all access granted)"
         
@@ -1408,16 +1481,19 @@ async def listchannels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     for i, ch in enumerate(active_channels):
         added_date = ch['added_at'].strftime('%Y-%m-%d') if ch['added_at'] else 'Unknown'
-        msg += f"{i+1}. @{ch['channel_username']}\n"
+        display_name = ch['channel_name'] or ch['channel_username']
+        msg += f"{i+1}. {display_name}\n"
+        msg += f"   └ Username: @{ch['channel_username']}\n"
         msg += f"   └ Added: {added_date}\n"
     
     if inactive_channels:
         msg += f"\n⏸️ *Inactive Channels ({len(inactive_channels)}):*\n"
         for i, ch in enumerate(inactive_channels):
-            msg += f"{i+1}. @{ch['channel_username']}\n"
+            display_name = ch['channel_name'] or ch['channel_username']
+            msg += f"{i+1}. {display_name} (@{ch['channel_username']})\n"
     
     msg += f"\n💡 *Commands:*\n"
-    msg += f"/addchannel @channel - Add channel\n"
+    msg += f"/addchannel @channel [name] - Add channel\n"
     msg += f"/removechannel @channel - Remove channel\n"
     msg += f"/testchannels - Test bot access to all channels"
     
@@ -1429,9 +1505,10 @@ async def testchannels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
-    channels = await db.get_required_channels(active_only=True)
+    channels_data = await db.get_channels_with_details()
+    active_channels = [c for c in channels_data if c['is_active'] == 1]
     
-    if not channels:
+    if not active_channels:
         sent_msg = await update.message.reply_text("📋 No channels configured.")
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
@@ -1439,24 +1516,27 @@ async def testchannels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text("🔍 Testing channel access...")
     
     results = []
-    for channel in channels:
+    for ch in active_channels:
+        channel = ch['channel_username']
+        display_name = ch['channel_name'] or channel
+        
         try:
             chat = await context.bot.get_chat(f"@{channel}")
             bot_member = await context.bot.get_chat_member(f"@{channel}", context.bot.id)
             
             if bot_member.status in ["administrator", "creator"]:
-                results.append(f"✅ @{channel} - Bot is admin")
+                results.append(f"✅ {display_name} - Bot is admin")
             else:
-                results.append(f"⚠️ @{channel} - Bot is member (not admin)")
+                results.append(f"⚠️ {display_name} - Bot is member (not admin)")
                 
         except Exception as e:
             error_msg = str(e)
             if "chat not found" in error_msg.lower():
-                results.append(f"❌ @{channel} - Channel not found")
+                results.append(f"❌ {display_name} - Channel not found")
             elif "forbidden" in error_msg.lower():
-                results.append(f"❌ @{channel} - Bot not in channel")
+                results.append(f"❌ {display_name} - Bot not in channel")
             else:
-                results.append(f"❌ @{channel} - Error: {error_msg[:50]}")
+                results.append(f"❌ {display_name} - Error: {error_msg[:50]}")
     
     result_text = "🔍 *Channel Access Test*\n\n" + "\n".join(results)
     
@@ -1513,7 +1593,7 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ *Upload Successful*\n\n"
             f"📁 *Name:* `{filename}`\n"
             f"🔑 *Key:* `{key}`\n"
-            f"💾 *Storage:* PERMANENT PostgreSQL\n\n"
+            f"💾 *Storage:* PERMANENT (No auto cleanup)\n\n"
             f"🔗 *Link:*\n`{link}`",
             parse_mode="Markdown"
         )
@@ -1525,7 +1605,7 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stats command (admin only)"""
+    """Stats command (admin only) - NOW WITH DATABASE STORAGE USAGE"""
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -1533,6 +1613,22 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_count = await db.get_file_count()
     user_count = await db.get_user_count()
     channel_count = await db.get_channel_count()
+
+    # Get total file storage
+    total_file_bytes = await db.get_total_storage_used()
+    
+    # Get database storage usage
+    db_storage = await db.get_db_storage_usage()
+    
+    # Format file storage
+    def format_bytes(bytes_val):
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if bytes_val < 1024.0:
+                return f"{bytes_val:.2f} {unit}"
+            bytes_val /= 1024.0
+        return f"{bytes_val:.2f} TB"
+    
+    file_storage = format_bytes(total_file_bytes)
 
     # Get total accesses
     files = await db.get_all_files()
@@ -1547,12 +1643,15 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🤖 Bot: @{escaped_bot_username}\n"
             f"⏱ Uptime: {uptime}\n"
             f"📁 Files: {file_count}\n"
+            f"📦 File Storage: {file_storage}\n"
+            f"💾 PostgreSQL: {db_storage['total']}\n"
+            f"   ├─ Tables: {db_storage['tables']}\n"
+            f"   └─ Indexes: {db_storage['indexes']}\n"
             f"👥 Users: {user_count}\n"
             f"📢 Required Channels: {channel_count}\n"
-            f"👀 Accesses: {total_access}\n"
-            f"💾 Database: PostgreSQL (permanent)\n"
+            f"👀 Total Accesses: {total_access}\n"
             f"⏰ Auto-delete: {DELETE_AFTER//60} minutes\n"
-            f"🔄 Dynamic Channels: Yes (Add/Remove anytime)",
+            f"🧹 Auto Cleanup: DISABLED (Permanent storage)",
             parse_mode="Markdown"
         )
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
@@ -1565,11 +1664,13 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🤖 Bot: @{bot_username}\n"
                 f"⏱ Uptime: {uptime}\n"
                 f"📁 Files: {file_count}\n"
+                f"📦 File Storage: {file_storage}\n"
+                f"💾 Database: {db_storage['total']}\n"
                 f"👥 Users: {user_count}\n"
                 f"📢 Required Channels: {channel_count}\n"
                 f"👀 Accesses: {total_access}\n"
-                f"💾 Database: PostgreSQL (permanent)\n"
-                f"⏰ Auto-delete: {DELETE_AFTER//60} minutes"
+                f"⏰ Auto-delete: {DELETE_AFTER//60} minutes\n"
+                f"🧹 Auto Cleanup: DISABLED"
             )
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         except Exception as e2:
@@ -1904,54 +2005,58 @@ async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
-    channels = await db.get_required_channels(active_only=True)
+    channels_data = await db.get_channels_with_details()
+    active_channels = [c for c in channels_data if c['is_active'] == 1]
     
-    if not channels:
+    if not active_channels:
         sent_msg = await update.message.reply_text("📋 No channels configured.")
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
 
     results = []
-    for channel in channels:
+    for ch in active_channels:
+        channel = ch['channel_username']
+        display_name = ch['channel_name'] or channel
+        
         try:
             member = await context.bot.get_chat_member(f"@{channel}", user_id)
             status = f"✅ {member.status}"
         except Exception as e:
             status = f"❌ {str(e)[:50]}"
         
-        results.append(f"@{channel}: {status}")
+        results.append(f"{display_name}: {status}")
 
     result_text = "🔍 *Channel Access Test*\n\n" + "\n".join(results)
     
     sent_msg = await update.message.reply_text(result_text, parse_mode="Markdown")
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
-async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manual cleanup (admin only)"""
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    days = 30
-    if context.args:
-        try:
-            days = int(context.args[0])
-        except:
-            pass
-
-    result = await db.execute_and_commit('''
-        DELETE FROM files
-        WHERE timestamp < CURRENT_TIMESTAMP - INTERVAL '1 day' * %s
-    ''', (days,))
-
-    file_count = await db.get_file_count()
-
-    sent_msg = await update.message.reply_text(
-        f"🧹 Cleaned files older than {days} days\n"
-        f"📁 Files remaining: {file_count}",
-        parse_mode="Markdown"
-    )
-    await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-
+# REMOVED AUTO CLEANUP COMMAND - Now manual only
+# async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     """Manual cleanup (admin only)"""
+#     if update.effective_user.id != ADMIN_ID:
+#         return
+#
+#     days = 30
+#     if context.args:
+#         try:
+#             days = int(context.args[0])
+#         except:
+#             pass
+#
+#     result = await db.execute_and_commit('''
+#         DELETE FROM files
+#         WHERE timestamp < CURRENT_TIMESTAMP - INTERVAL '1 day' * %s
+#     ''', (days,))
+#
+#     file_count = await db.get_file_count()
+#
+#     sent_msg = await update.message.reply_text(
+#         f"🧹 Cleaned files older than {days} days\n"
+#         f"📁 Files remaining: {file_count}",
+#         parse_mode="Markdown"
+#     )
+#     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 # ============ MAIN ============
 async def initialize_bot():
@@ -1982,7 +2087,7 @@ async def initialize_bot():
     bot_loop = asyncio.get_running_loop()
     bot_app = application
 
-    # Add job queue for cleanup
+    # Add job queue for cleanup (only message deletion, not file cleanup)
     if application.job_queue:
         application.job_queue.run_repeating(
             cleanup_overdue_messages,
@@ -2002,9 +2107,10 @@ async def initialize_bot():
     application.add_handler(CommandHandler("broadcast", broadcast))
     application.add_handler(CommandHandler("clearcache", clearcache))
     application.add_handler(CommandHandler("testchannel", testchannel))
-    application.add_handler(CommandHandler("cleanup", cleanup))
+    # REMOVED cleanup command - No auto cleanup
+    # application.add_handler(CommandHandler("cleanup", cleanup))
     
-    # ============ NEW CHANNEL MANAGEMENT COMMANDS ============
+    # Channel management commands
     application.add_handler(CommandHandler("addchannel", addchannel))
     application.add_handler(CommandHandler("removechannel", removechannel))
     application.add_handler(CommandHandler("listchannels", listchannels))
@@ -2050,6 +2156,7 @@ async def initialize_bot():
     log.info(f"📁 Files in database: {await db.get_file_count()}")
     log.info(f"👥 Users in database: {await db.get_user_count()}")
     log.info(f"📢 Required channels: {await db.get_channel_count()}")
+    log.info(f"🧹 Auto cleanup: DISABLED (Permanent storage)")
 
     return application
 
@@ -2072,13 +2179,13 @@ async def main_async():
 def main():
     """Main function"""
     print("\n" + "=" * 60)
-    print("🤖 TELEGRAM FILE BOT - Dynamic Channel Management")
+    print("🤖 TELEGRAM FILE BOT - Enhanced UI + Storage Stats")
     print("=" * 60)
     print(f"✅ Bot: @{bot_username}")
     print(f"✅ Admin: {ADMIN_ID}")
-    print(f"✅ Database: Render PostgreSQL with psycopg2-binary")
+    print(f"✅ Database: Render PostgreSQL")
+    print(f"✅ Auto Cleanup: DISABLED (Permanent storage)")
     print(f"✅ Python Version: {sys.version}")
-    print(f"✅ Dynamic Channels: Add/Remove anytime")
     print("=" * 60 + "\n")
 
     # Start Flask in a separate thread
