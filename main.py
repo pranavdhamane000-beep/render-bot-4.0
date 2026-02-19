@@ -44,9 +44,11 @@ from telegram.request import HTTPXRequest
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
-# Channel usernames (without @)
-CHANNEL_1 = os.environ.get("CHANNEL_1", "A_Knight_of_the_Seven_Kingdoms_t").replace("@", "")
-CHANNEL_2 = os.environ.get("CHANNEL_2", "your_movies_web").replace("@", "")
+# Default channels (will be added to database on first run)
+DEFAULT_CHANNELS = [
+    os.environ.get("CHANNEL_1", "A_Knight_of_the_Seven_Kingdoms_t").replace("@", ""),
+    os.environ.get("CHANNEL_2", "your_movies_web").replace("@", "")
+]
 
 # ============ RENDER POSTGRESQL WITH PSYCOPG2 ============
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -139,6 +141,7 @@ class Database:
 
     def _init_db(self, conn, cur):
         """Initialize database tables (synchronous)"""
+        # Files table
         cur.execute('''
             CREATE TABLE IF NOT EXISTS files (
                 id SERIAL PRIMARY KEY,
@@ -151,6 +154,8 @@ class Database:
                 access_count INTEGER DEFAULT 0
             )
         ''')
+        
+        # Membership cache table
         cur.execute('''
             CREATE TABLE IF NOT EXISTS membership_cache (
                 user_id BIGINT,
@@ -160,6 +165,8 @@ class Database:
                 PRIMARY KEY (user_id, channel)
             )
         ''')
+        
+        # Scheduled deletions table
         cur.execute('''
             CREATE TABLE IF NOT EXISTS scheduled_deletions (
                 chat_id BIGINT NOT NULL,
@@ -169,6 +176,8 @@ class Database:
                 PRIMARY KEY (chat_id, message_id)
             )
         ''')
+        
+        # Users table
         cur.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
@@ -182,11 +191,42 @@ class Database:
                 last_file_accessed TIMESTAMP
             )
         ''')
+        
+        # ============ NEW: Channels table for dynamic membership checking ============
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS required_channels (
+                id SERIAL PRIMARY KEY,
+                channel_username TEXT UNIQUE NOT NULL,
+                channel_name TEXT,
+                added_by BIGINT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_active INTEGER DEFAULT 1,
+                position INTEGER DEFAULT 0
+            )
+        ''')
+        
+        # Create indexes
         cur.execute('CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(timestamp)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_cache_timestamp ON membership_cache(timestamp)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_deletions_time ON scheduled_deletions(scheduled_time)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_users_last_active ON users(last_active)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_users_first_seen ON users(first_seen)')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_channels_active ON required_channels(is_active)')
+        
+        # Insert default channels if table is empty
+        cur.execute("SELECT COUNT(*) FROM required_channels")
+        count = cur.fetchone()[0]
+        
+        if count == 0 and DEFAULT_CHANNELS:
+            for i, channel in enumerate(DEFAULT_CHANNELS):
+                if channel:  # Only if not empty
+                    cur.execute('''
+                        INSERT INTO required_channels (channel_username, channel_name, position, is_active)
+                        VALUES (%s, %s, %s, 1)
+                        ON CONFLICT (channel_username) DO NOTHING
+                    ''', (channel, f"Channel {i+1}", i))
+                    log.info(f"Added default channel: {channel}")
+        
         conn.commit()
 
     @asynccontextmanager
@@ -236,6 +276,106 @@ class Database:
                     return cur.rowcount
             return await asyncio.to_thread(_execute)
 
+    # ============ NEW: Channel management methods ============
+    async def get_required_channels(self, active_only: bool = True) -> List[str]:
+        """Get list of all required channels"""
+        if active_only:
+            rows = await self.fetchall("SELECT channel_username FROM required_channels WHERE is_active = 1 ORDER BY position, id")
+        else:
+            rows = await self.fetchall("SELECT channel_username FROM required_channels ORDER BY position, id")
+        
+        return [row['channel_username'] for row in rows]
+    
+    async def get_channels_with_details(self) -> List[Dict]:
+        """Get channels with all details for listing"""
+        rows = await self.fetchall('''
+            SELECT id, channel_username, channel_name, added_at, is_active, position
+            FROM required_channels
+            ORDER BY position, id
+        ''')
+        return [dict(row) for row in rows]
+    
+    async def add_channel(self, channel_username: str, added_by: int, channel_name: str = None) -> bool:
+        """Add a new required channel"""
+        # Clean username (remove @ if present)
+        clean_username = channel_username.replace("@", "").strip()
+        
+        if not clean_username:
+            return False
+        
+        # Get max position for new channel
+        result = await self.fetchrow("SELECT COALESCE(MAX(position), -1) + 1 as next_pos FROM required_channels")
+        next_pos = result['next_pos'] if result else 0
+        
+        try:
+            await self.execute_and_commit('''
+                INSERT INTO required_channels (channel_username, channel_name, added_by, position, is_active)
+                VALUES (%s, %s, %s, %s, 1)
+                ON CONFLICT (channel_username) DO UPDATE
+                SET is_active = 1,
+                    added_by = EXCLUDED.added_by,
+                    channel_name = COALESCE(EXCLUDED.channel_name, required_channels.channel_name)
+            ''', (clean_username, channel_name or clean_username, added_by, next_pos))
+            
+            log.info(f"Channel added: @{clean_username} by user {added_by}")
+            return True
+        except Exception as e:
+            log.error(f"Error adding channel: {e}")
+            return False
+    
+    async def remove_channel(self, channel_username: str) -> bool:
+        """Remove a required channel (soft delete by setting inactive)"""
+        clean_username = channel_username.replace("@", "").strip()
+        
+        rowcount = await self.execute_and_commit('''
+            UPDATE required_channels SET is_active = 0
+            WHERE channel_username = %s
+        ''', (clean_username,))
+        
+        if rowcount > 0:
+            log.info(f"Channel removed: @{clean_username}")
+            
+            # Also clear cache for this channel
+            await self.execute_and_commit("DELETE FROM membership_cache WHERE channel = %s", (clean_username,))
+            return True
+        return False
+    
+    async def delete_channel_permanently(self, channel_username: str) -> bool:
+        """Permanently delete a channel from database"""
+        clean_username = channel_username.replace("@", "").strip()
+        
+        # Clear cache first
+        await self.execute_and_commit("DELETE FROM membership_cache WHERE channel = %s", (clean_username,))
+        
+        rowcount = await self.execute_and_commit('''
+            DELETE FROM required_channels WHERE channel_username = %s
+        ''', (clean_username,))
+        
+        if rowcount > 0:
+            log.info(f"Channel permanently deleted: @{clean_username}")
+            return True
+        return False
+    
+    async def reorder_channels(self, channel_order: List[str]) -> bool:
+        """Reorder channels (admin only)"""
+        try:
+            for i, channel in enumerate(channel_order):
+                clean = channel.replace("@", "")
+                await self.execute_and_commit('''
+                    UPDATE required_channels SET position = %s
+                    WHERE channel_username = %s
+                ''', (i, clean))
+            return True
+        except Exception as e:
+            log.error(f"Error reordering channels: {e}")
+            return False
+    
+    async def get_channel_count(self) -> int:
+        """Get number of active required channels"""
+        result = await self.fetchrow("SELECT COUNT(*) as count FROM required_channels WHERE is_active = 1")
+        return result['count'] if result else 0
+
+    # ============ Existing database methods ============
     async def save_file(self, file_id: str, file_info: dict) -> str:
         """Save file info and return generated ID."""
         async with self.get_db_connection() as conn:
@@ -308,11 +448,20 @@ class Database:
         ''', (user_id, channel))
         return bool(result['is_member']) if result else None
 
-    async def clear_membership_cache(self, user_id: Optional[int] = None):
-        """Clear membership cache for a user or all users."""
-        if user_id:
+    async def clear_membership_cache(self, user_id: Optional[int] = None, channel: Optional[str] = None):
+        """Clear membership cache for a user, channel, or all."""
+        if user_id and channel:
+            await self.execute_and_commit(
+                "DELETE FROM membership_cache WHERE user_id = %s AND channel = %s",
+                (user_id, channel.replace("@", ""))
+            )
+        elif user_id:
             await self.execute_and_commit("DELETE FROM membership_cache WHERE user_id = %s", (user_id,))
-            log.info(f"Cleared cache for user {user_id}")
+        elif channel:
+            await self.execute_and_commit(
+                "DELETE FROM membership_cache WHERE channel = %s",
+                (channel.replace("@", ""),)
+            )
         else:
             await self.execute_and_commit("DELETE FROM membership_cache")
             log.info("Cleared all membership cache")
@@ -563,11 +712,13 @@ async def cleanup_overdue_messages(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error(f"Error in cleanup_overdue_messages: {e}")
 
-# ============ MEMBERSHIP CHECK ============
+# ============ DYNAMIC MEMBERSHIP CHECK ============
 async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bool = False) -> bool:
     """Check if user is in channel"""
+    clean_channel = channel.replace("@", "")
+    
     if not force_check:
-        cached = await db.get_cached_membership(user_id, channel)
+        cached = await db.get_cached_membership(user_id, clean_channel)
         if cached is not None:
             return cached
 
@@ -580,50 +731,55 @@ async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bo
         member = await bot.get_chat_member(chat_id=channel_username, user_id=user_id)
         is_member = member.status in ["member", "administrator", "creator"]
 
-        await db.cache_membership(user_id, channel.replace("@", ""), is_member)
+        await db.cache_membership(user_id, clean_channel, is_member)
         return is_member
 
     except Exception as e:
         error_msg = str(e).lower()
         if "user not found" in error_msg or "user not participant" in error_msg:
-            await db.cache_membership(user_id, channel.replace("@", ""), False)
+            await db.cache_membership(user_id, clean_channel, False)
             return False
         elif "chat not found" in error_msg:
-            log.error(f"Channel @{channel} not found!")
+            log.error(f"Channel @{clean_channel} not found!")
+            # Still return True to allow access if channel doesn't exist
             return True
         elif "forbidden" in error_msg:
-            log.error(f"Bot can't access @{channel}")
+            log.error(f"Bot can't access @{clean_channel}")
             return True
         else:
+            log.error(f"Unexpected error checking channel {clean_channel}: {e}")
             return True
 
 async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, force_check: bool = False) -> Dict[str, Any]:
-    """Check if user is member of both channels"""
+    """Check if user is member of all required channels"""
     bot = context.bot
 
     result = {
-        "channel1": False,
-        "channel2": False,
         "all_joined": False,
-        "missing_channels": []
+        "missing_channels": [],
+        "channel_status": {}
     }
+
+    # Get all active required channels
+    channels = await db.get_required_channels(active_only=True)
+    
+    if not channels:
+        # No channels required - auto approve
+        result["all_joined"] = True
+        return result
 
     if force_check:
         await db.clear_membership_cache(user_id)
 
-    # Check channel 1
-    ch1_result = await check_user_in_channel(bot, CHANNEL_1, user_id, force_check)
-    result["channel1"] = ch1_result
-    if not ch1_result:
-        result["missing_channels"].append(f"@{CHANNEL_1}")
+    # Check each channel
+    for channel in channels:
+        is_member = await check_user_in_channel(bot, channel, user_id, force_check)
+        result["channel_status"][f"@{channel}"] = is_member
+        
+        if not is_member:
+            result["missing_channels"].append(f"@{channel}")
 
-    # Check channel 2
-    ch2_result = await check_user_in_channel(bot, CHANNEL_2, user_id, force_check)
-    result["channel2"] = ch2_result
-    if not ch2_result:
-        result["missing_channels"].append(f"@{CHANNEL_2}")
-
-    result["all_joined"] = result["channel1"] and result["channel2"]
+    result["all_joined"] = len(result["missing_channels"]) == 0
     return result
 
 # ============ WEB ROUTES ============
@@ -706,6 +862,7 @@ def home():
             <p>Uptime: {{ uptime }}</p>
             <p>Files in DB: {{ file_count }}</p>
             <p>Users in DB: {{ user_count }}</p>
+            <p>Required Channels: {{ channel_count }}</p>
             <p>📁 Storage: PERMANENT PostgreSQL</p>
         </div>
 
@@ -714,9 +871,10 @@ def home():
             <ul>
                 <li>Bot: <strong>@{{ bot_username }}</strong></li>
                 <li>Database: <strong>Render PostgreSQL</strong></li>
-                <li>Driver: <strong>psycopg2-binary (C-based, fast)</strong></li>
-                <li>Storage: <strong>PERMANENT - Survives restarts!</strong></li>
+                <li>Driver: <strong>psycopg2-binary</strong></li>
+                <li>Storage: <strong>PERMANENT</strong></li>
                 <li>Message Auto-delete: <strong>{{ delete_minutes }} minutes</strong></li>
+                <li>Dynamic Channels: <strong>Yes (Add/Remove anytime)</strong></li>
             </ul>
         </div>
 
@@ -738,11 +896,13 @@ def home():
         asyncio.set_event_loop(loop)
         file_count = loop.run_until_complete(db.get_file_count())
         user_count = loop.run_until_complete(db.get_user_count())
+        channel_count = loop.run_until_complete(db.get_channel_count())
         loop.close()
     except Exception as e:
         log.error(f"Error fetching counts for home route: {e}")
         file_count = 0
         user_count = 0
+        channel_count = 0
 
     return render_template_string(html_content,
                                   bot_username=bot_username,
@@ -750,8 +910,7 @@ def home():
                                   current_time=datetime.now().strftime("%H:%M:%S"),
                                   file_count=file_count,
                                   user_count=user_count,
-                                  channel1=CHANNEL_1,
-                                  channel2=CHANNEL_2,
+                                  channel_count=channel_count,
                                   delete_minutes=DELETE_AFTER//60)
 
 @app.route('/health')
@@ -761,11 +920,13 @@ def health():
         asyncio.set_event_loop(loop)
         file_count = loop.run_until_complete(db.get_file_count())
         user_count = loop.run_until_complete(db.get_user_count())
+        channel_count = loop.run_until_complete(db.get_channel_count())
         loop.close()
     except Exception as e:
         log.error(f"Error in health check: {e}")
         file_count = 0
         user_count = 0
+        channel_count = 0
 
     return jsonify({
         "status": "OK",
@@ -777,6 +938,8 @@ def health():
         "storage": "permanent",
         "file_count": file_count,
         "user_count": user_count,
+        "channel_count": channel_count,
+        "dynamic_channels": True,
         "bot_initialized": bot_initialized
     }), 200
 
@@ -863,22 +1026,42 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             last_name=user.last_name
         )
 
+        # Get required channels for display
+        channels = await db.get_required_channels(active_only=True)
+        
         # No file key - show welcome
         if not args:
-            keyboard = [
-                [InlineKeyboardButton("📢 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
-                [InlineKeyboardButton("📢 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")],
-                [InlineKeyboardButton("🔄 Check Membership", callback_data="check_membership")]
-            ]
+            keyboard = []
+            
+            # Add buttons for each required channel
+            for channel in channels:
+                keyboard.append([InlineKeyboardButton(
+                    f"📢 Join @{channel}", 
+                    url=f"https://t.me/{channel}"
+                )])
+            
+            # Add check membership button
+            keyboard.append([InlineKeyboardButton(
+                "🔄 Check Membership", 
+                callback_data="check_membership"
+            )])
+
+            channel_text = ""
+            if channels:
+                channel_text = "\n".join([f"{i+1}. Join @{ch}" for i, ch in enumerate(channels)])
+            else:
+                channel_text = "No channels required!"
 
             sent_msg = await update.message.reply_text(
                 "🤖 *Welcome to File Sharing Bot*\n\n"
                 "🔗 *How to use:*\n"
                 "1️⃣ Use admin-provided links\n"
-                "2️⃣ Join both channels\n"
+                "2️⃣ Join the required channels:\n"
+                f"{channel_text}\n"
                 "3️⃣ Click 'Check Membership'\n\n"
                 f"⚠️ Messages auto-delete after {DELETE_AFTER//60} minutes\n"
-                "💾 *Storage:* PERMANENT PostgreSQL",
+                "💾 *Storage:* PERMANENT PostgreSQL\n"
+                "📢 *Dynamic Channels:* Add/remove anytime by admin",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
@@ -898,23 +1081,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await check_membership(user_id, context, force_check=True)
 
         if not result["all_joined"]:
-            missing_count = len(result["missing_channels"])
-
-            if missing_count == 2:
-                keyboard = [
-                    [InlineKeyboardButton("📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
-                    [InlineKeyboardButton("📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")],
-                    [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
-                ]
-                text = "🔒 *Join both channels to access this file*"
+            missing_channels = result["missing_channels"]
+            keyboard = []
+            
+            # Add buttons for missing channels
+            for channel in missing_channels:
+                clean_channel = channel.replace("@", "")
+                keyboard.append([InlineKeyboardButton(
+                    f"📥 Join {channel}", 
+                    url=f"https://t.me/{clean_channel}"
+                )])
+            
+            # Add check again button
+            keyboard.append([InlineKeyboardButton(
+                "✅ Check Again", 
+                callback_data=f"check|{key}"
+            )])
+            
+            if len(missing_channels) == 1:
+                text = f"🔒 *Join {missing_channels[0]} to access this file*"
             else:
-                missing_channel = result["missing_channels"][0].replace("@", "")
-                channel_name = "Channel 1" if CHANNEL_1 in missing_channel else "Channel 2"
-                keyboard = [
-                    [InlineKeyboardButton(f"📥 Join {channel_name}", url=f"https://t.me/{missing_channel}")],
-                    [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
-                ]
-                text = f"🔒 *Join {channel_name} to access this file*"
+                text = "🔒 *Join all required channels to access this file*"
 
             sent_msg = await update.message.reply_text(
                 text,
@@ -981,29 +1168,38 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result = await check_membership(user_id, context, force_check=True)
 
             if result["all_joined"]:
+                # Get channels for display
+                channels = await db.get_required_channels(active_only=True)
+                channel_list = "\n".join([f"✅ @{ch}" for ch in channels])
+                
                 await query.edit_message_text(
-                    "✅ *You've joined both channels!*\n\n"
-                    "Now you can use file links from admin.",
+                    f"✅ *You've joined all required channels!*\n\n"
+                    f"{channel_list}\n\n"
+                    f"Now you can use file links from admin.",
                     parse_mode="Markdown"
                 )
             else:
-                missing_count = len(result["missing_channels"])
-
-                if missing_count == 2:
-                    keyboard = [
-                        [InlineKeyboardButton("📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
-                        [InlineKeyboardButton("📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")],
-                        [InlineKeyboardButton("🔄 Check Again", callback_data="check_membership")]
-                    ]
-                    text = "❌ *Not a member of either channel*"
+                missing_channels = result["missing_channels"]
+                keyboard = []
+                
+                # Add buttons for missing channels
+                for channel in missing_channels:
+                    clean_channel = channel.replace("@", "")
+                    keyboard.append([InlineKeyboardButton(
+                        f"📥 Join {channel}", 
+                        url=f"https://t.me/{clean_channel}"
+                    )])
+                
+                # Add check again button
+                keyboard.append([InlineKeyboardButton(
+                    "🔄 Check Again", 
+                    callback_data="check_membership"
+                )])
+                
+                if len(missing_channels) == 1:
+                    text = f"❌ *Missing {missing_channels[0]}*"
                 else:
-                    missing = result["missing_channels"][0].replace("@", "")
-                    name = "Channel 1" if CHANNEL_1 in missing else "Channel 2"
-                    keyboard = [
-                        [InlineKeyboardButton(f"📥 Join {name}", url=f"https://t.me/{missing}")],
-                        [InlineKeyboardButton("🔄 Check Again", callback_data="check_membership")]
-                    ]
-                    text = f"❌ *Missing {name}*"
+                    text = "❌ *Not a member of required channels*"
 
                 await query.edit_message_text(
                     text,
@@ -1023,23 +1219,27 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result = await check_membership(user_id, context, force_check=True)
 
             if not result['all_joined']:
-                missing_count = len(result["missing_channels"])
-
-                if missing_count == 2:
-                    keyboard = [
-                        [InlineKeyboardButton("📥 Join Channel 1", url=f"https://t.me/{CHANNEL_1}")],
-                        [InlineKeyboardButton("📥 Join Channel 2", url=f"https://t.me/{CHANNEL_2}")],
-                        [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
-                    ]
-                    text = "❌ *Join both channels*"
+                missing_channels = result["missing_channels"]
+                keyboard = []
+                
+                # Add buttons for missing channels
+                for channel in missing_channels:
+                    clean_channel = channel.replace("@", "")
+                    keyboard.append([InlineKeyboardButton(
+                        f"📥 Join {channel}", 
+                        url=f"https://t.me/{clean_channel}"
+                    )])
+                
+                # Add check again button
+                keyboard.append([InlineKeyboardButton(
+                    "✅ Check Again", 
+                    callback_data=f"check|{key}"
+                )])
+                
+                if len(missing_channels) == 1:
+                    text = f"❌ *Join {missing_channels[0]}*"
                 else:
-                    missing = result["missing_channels"][0].replace("@", "")
-                    name = "Channel 1" if CHANNEL_1 in missing else "Channel 2"
-                    keyboard = [
-                        [InlineKeyboardButton(f"📥 Join {name}", url=f"https://t.me/{missing}")],
-                        [InlineKeyboardButton("✅ Check Again", callback_data=f"check|{key}")]
-                    ]
-                    text = f"❌ *Join {name}*"
+                    text = "❌ *Join all required channels*"
 
                 await query.edit_message_text(
                     text,
@@ -1084,6 +1284,186 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error(f"Callback error: {e}", exc_info=True)
 
+# ============ NEW CHANNEL MANAGEMENT COMMANDS ============
+async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add a new required channel (admin only)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    if not context.args:
+        sent_msg = await update.message.reply_text(
+            "❌ Usage: /addchannel <channel username>\n"
+            "Example: /addchannel @my_channel"
+        )
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        return
+
+    channel = context.args[0]
+    user_id = update.effective_user.id
+    
+    # Try to verify bot is admin in the channel
+    try:
+        clean_channel = channel.replace("@", "")
+        chat = await context.bot.get_chat(f"@{clean_channel}")
+        
+        # Check if bot is admin
+        bot_member = await context.bot.get_chat_member(f"@{clean_channel}", context.bot.id)
+        if bot_member.status not in ["administrator", "creator"]:
+            keyboard = [[InlineKeyboardButton(
+                "🤖 Add Bot to Channel",
+                url=f"https://t.me/{clean_channel}?startchannel=bot"
+            )]]
+            
+            sent_msg = await update.message.reply_text(
+                f"⚠️ *Bot is not an admin in @{clean_channel}*\n\n"
+                f"Make sure to add the bot as admin to check memberships!",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+            return
+            
+    except Exception as e:
+        log.warning(f"Could not verify bot in channel {channel}: {e}")
+        # Continue anyway - maybe channel exists but bot not added yet
+
+    # Add channel to database
+    success = await db.add_channel(channel, user_id)
+    
+    if success:
+        channels = await db.get_required_channels(active_only=True)
+        channel_list = "\n".join([f"{i+1}. @{ch}" for i, ch in enumerate(channels)])
+        
+        sent_msg = await update.message.reply_text(
+            f"✅ *Channel added successfully!*\n\n"
+            f"Added: @{channel.replace('@', '')}\n\n"
+            f"📋 *Current required channels:*\n{channel_list}",
+            parse_mode="Markdown"
+        )
+    else:
+        sent_msg = await update.message.reply_text(
+            f"❌ Failed to add channel. It might already exist."
+        )
+    
+    await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+
+async def removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove a required channel (admin only)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    if not context.args:
+        sent_msg = await update.message.reply_text(
+            "❌ Usage: /removechannel <channel username>\n"
+            "Example: /removechannel @my_channel"
+        )
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        return
+
+    channel = context.args[0]
+    
+    success = await db.remove_channel(channel)
+    
+    if success:
+        channels = await db.get_required_channels(active_only=True)
+        if channels:
+            channel_list = "\n".join([f"{i+1}. @{ch}" for i, ch in enumerate(channels)])
+        else:
+            channel_list = "No channels required (all access granted)"
+        
+        sent_msg = await update.message.reply_text(
+            f"✅ *Channel removed successfully!*\n\n"
+            f"Removed: @{channel.replace('@', '')}\n\n"
+            f"📋 *Current required channels:*\n{channel_list}",
+            parse_mode="Markdown"
+        )
+    else:
+        sent_msg = await update.message.reply_text(
+            f"❌ Channel not found or already removed."
+        )
+    
+    await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+
+async def listchannels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all required channels (admin only)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    channels = await db.get_channels_with_details()
+    
+    if not channels:
+        sent_msg = await update.message.reply_text(
+            "📋 *No channels configured*\n\n"
+            "Use /addchannel to add required channels.",
+            parse_mode="Markdown"
+        )
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        return
+
+    active_channels = [c for c in channels if c['is_active'] == 1]
+    inactive_channels = [c for c in channels if c['is_active'] == 0]
+    
+    msg = f"📋 *Channel Management*\n\n"
+    msg += f"📢 *Active Channels ({len(active_channels)}):*\n"
+    
+    for i, ch in enumerate(active_channels):
+        added_date = ch['added_at'].strftime('%Y-%m-%d') if ch['added_at'] else 'Unknown'
+        msg += f"{i+1}. @{ch['channel_username']}\n"
+        msg += f"   └ Added: {added_date}\n"
+    
+    if inactive_channels:
+        msg += f"\n⏸️ *Inactive Channels ({len(inactive_channels)}):*\n"
+        for i, ch in enumerate(inactive_channels):
+            msg += f"{i+1}. @{ch['channel_username']}\n"
+    
+    msg += f"\n💡 *Commands:*\n"
+    msg += f"/addchannel @channel - Add channel\n"
+    msg += f"/removechannel @channel - Remove channel\n"
+    msg += f"/testchannels - Test bot access to all channels"
+    
+    sent_msg = await update.message.reply_text(msg, parse_mode="Markdown")
+    await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+
+async def testchannels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test bot access to all required channels (admin only)"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    channels = await db.get_required_channels(active_only=True)
+    
+    if not channels:
+        sent_msg = await update.message.reply_text("📋 No channels configured.")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        return
+
+    status_msg = await update.message.reply_text("🔍 Testing channel access...")
+    
+    results = []
+    for channel in channels:
+        try:
+            chat = await context.bot.get_chat(f"@{channel}")
+            bot_member = await context.bot.get_chat_member(f"@{channel}", context.bot.id)
+            
+            if bot_member.status in ["administrator", "creator"]:
+                results.append(f"✅ @{channel} - Bot is admin")
+            else:
+                results.append(f"⚠️ @{channel} - Bot is member (not admin)")
+                
+        except Exception as e:
+            error_msg = str(e)
+            if "chat not found" in error_msg.lower():
+                results.append(f"❌ @{channel} - Channel not found")
+            elif "forbidden" in error_msg.lower():
+                results.append(f"❌ @{channel} - Bot not in channel")
+            else:
+                results.append(f"❌ @{channel} - Error: {error_msg[:50]}")
+    
+    result_text = "🔍 *Channel Access Test*\n\n" + "\n".join(results)
+    
+    await status_msg.edit_text(result_text, parse_mode="Markdown")
+    await schedule_message_deletion(context, status_msg.chat_id, status_msg.message_id)
+
+# ============ EXISTING COMMAND HANDLERS ============
 async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Upload file handler (admin only)"""
     if update.effective_user.id != ADMIN_ID:
@@ -1152,6 +1532,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uptime = str(timedelta(seconds=int(time.time() - start_time)))
     file_count = await db.get_file_count()
     user_count = await db.get_user_count()
+    channel_count = await db.get_channel_count()
 
     # Get total accesses
     files = await db.get_all_files()
@@ -1167,9 +1548,11 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏱ Uptime: {uptime}\n"
             f"📁 Files: {file_count}\n"
             f"👥 Users: {user_count}\n"
+            f"📢 Required Channels: {channel_count}\n"
             f"👀 Accesses: {total_access}\n"
             f"💾 Database: PostgreSQL (permanent)\n"
-            f"⏰ Auto-delete: {DELETE_AFTER//60} minutes",
+            f"⏰ Auto-delete: {DELETE_AFTER//60} minutes\n"
+            f"🔄 Dynamic Channels: Yes (Add/Remove anytime)",
             parse_mode="Markdown"
         )
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
@@ -1183,6 +1566,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⏱ Uptime: {uptime}\n"
                 f"📁 Files: {file_count}\n"
                 f"👥 Users: {user_count}\n"
+                f"📢 Required Channels: {channel_count}\n"
                 f"👀 Accesses: {total_access}\n"
                 f"💾 Database: PostgreSQL (permanent)\n"
                 f"⏰ Auto-delete: {DELETE_AFTER//60} minutes"
@@ -1503,35 +1887,43 @@ async def clearcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
-    await db.clear_membership_cache()
-    sent_msg = await update.message.reply_text("✅ Cache cleared")
+    # Optional: clear cache for specific channel
+    if context.args:
+        channel = context.args[0]
+        await db.clear_membership_cache(channel=channel)
+        sent_msg = await update.message.reply_text(f"✅ Cache cleared for channel {channel}")
+    else:
+        await db.clear_membership_cache()
+        sent_msg = await update.message.reply_text("✅ All cache cleared")
+    
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Test channel access (admin only)"""
+    """Test channel access (admin only) - Updated for dynamic channels"""
     if update.effective_user.id != ADMIN_ID:
         return
 
     user_id = update.effective_user.id
+    channels = await db.get_required_channels(active_only=True)
+    
+    if not channels:
+        sent_msg = await update.message.reply_text("📋 No channels configured.")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        return
 
-    try:
-        member1 = await context.bot.get_chat_member(f"@{CHANNEL_1}", user_id)
-        ch1 = f"✅ {member1.status}"
-    except Exception as e:
-        ch1 = f"❌ {str(e)[:50]}"
+    results = []
+    for channel in channels:
+        try:
+            member = await context.bot.get_chat_member(f"@{channel}", user_id)
+            status = f"✅ {member.status}"
+        except Exception as e:
+            status = f"❌ {str(e)[:50]}"
+        
+        results.append(f"@{channel}: {status}")
 
-    try:
-        member2 = await context.bot.get_chat_member(f"@{CHANNEL_2}", user_id)
-        ch2 = f"✅ {member2.status}"
-    except Exception as e:
-        ch2 = f"❌ {str(e)[:50]}"
-
-    sent_msg = await update.message.reply_text(
-        f"🔍 *Channel Test*\n\n"
-        f"@{CHANNEL_1}: {ch1}\n"
-        f"@{CHANNEL_2}: {ch2}",
-        parse_mode="Markdown"
-    )
+    result_text = "🔍 *Channel Access Test*\n\n" + "\n".join(results)
+    
+    sent_msg = await update.message.reply_text(result_text, parse_mode="Markdown")
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1611,6 +2003,12 @@ async def initialize_bot():
     application.add_handler(CommandHandler("clearcache", clearcache))
     application.add_handler(CommandHandler("testchannel", testchannel))
     application.add_handler(CommandHandler("cleanup", cleanup))
+    
+    # ============ NEW CHANNEL MANAGEMENT COMMANDS ============
+    application.add_handler(CommandHandler("addchannel", addchannel))
+    application.add_handler(CommandHandler("removechannel", removechannel))
+    application.add_handler(CommandHandler("listchannels", listchannels))
+    application.add_handler(CommandHandler("testchannels", testchannels))
 
     # Add callback handlers
     application.add_handler(CallbackQueryHandler(check_join, pattern="^check_membership$"))
@@ -1651,6 +2049,7 @@ async def initialize_bot():
     log.info("🤖 Bot initialized and ready via webhook")
     log.info(f"📁 Files in database: {await db.get_file_count()}")
     log.info(f"👥 Users in database: {await db.get_user_count()}")
+    log.info(f"📢 Required channels: {await db.get_channel_count()}")
 
     return application
 
@@ -1673,12 +2072,13 @@ async def main_async():
 def main():
     """Main function"""
     print("\n" + "=" * 60)
-    print("🤖 TELEGRAM FILE BOT - Python 3.14+ Compatibility Mode (Webhook)")
+    print("🤖 TELEGRAM FILE BOT - Dynamic Channel Management")
     print("=" * 60)
     print(f"✅ Bot: @{bot_username}")
     print(f"✅ Admin: {ADMIN_ID}")
     print(f"✅ Database: Render PostgreSQL with psycopg2-binary")
     print(f"✅ Python Version: {sys.version}")
+    print(f"✅ Dynamic Channels: Add/Remove anytime")
     print("=" * 60 + "\n")
 
     # Start Flask in a separate thread
