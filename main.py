@@ -1116,8 +1116,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Error handler"""
     log.error(f"Error: {context.error}", exc_info=True)
 
+# ============ FIXED START COMMAND - Shows ALL missing channels ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command handler - FIXED: Now checks ALL channels for file links too"""
+    """Start command handler - FIXED: Shows buttons for ALL missing channels"""
     try:
         if not update.message:
             return
@@ -1192,13 +1193,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await check_membership(user_id, context, force_check=True)
 
         if not result["all_joined"]:
-            missing_names = result["missing_channel_names"]
-            missing_channels = result["missing_channels"]
+            missing_channels = result["missing_channels"]  # List of channel usernames
+            missing_names = result["missing_channel_names"]  # List of friendly names
+            
+            # Create keyboard with buttons for EACH missing channel
             keyboard = []
             
-            # Add buttons for missing channels with friendly names
+            # Add a button for EVERY missing channel (not just one!)
             for i, channel in enumerate(missing_channels):
-                channel_name = missing_names[i] if i < len(missing_names) else f"Channel"
+                channel_name = missing_names[i] if i < len(missing_names) else f"Channel {i+1}"
                 keyboard.append([InlineKeyboardButton(
                     f"📥 Join {channel_name}", 
                     url=f"https://t.me/{channel}"
@@ -1210,10 +1213,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 callback_data=f"check|{key}"
             )])
             
+            # Create appropriate message based on number of missing channels
             if len(missing_names) == 1:
                 text = f"🔒 *Join {missing_names[0]} to access this file*"
+            elif len(missing_names) == 2:
+                text = f"🔒 *Join {missing_names[0]} and {missing_names[1]} to access this file*"
             else:
-                text = "🔒 *Join all required channels to access this file*"
+                channels_text = ", ".join(missing_names[:-1]) + f" and {missing_names[-1]}"
+                text = f"🔒 *Join {channels_text} to access this file*"
 
             sent_msg = await update.message.reply_text(
                 text,
@@ -1258,8 +1265,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error(f"Start error: {e}", exc_info=True)
 
+# ============ FIXED CHECK JOIN - Shows ALL missing channels ============
 async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle callback queries"""
+    """Handle callback queries - FIXED: Shows buttons for ALL missing channels"""
     try:
         query = update.callback_query
         await query.answer()
@@ -1277,7 +1285,6 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if data == "check_membership":
-            # FORCE CHECK membership with latest channels
             result = await check_membership(user_id, context, force_check=True)
 
             if result["all_joined"]:
@@ -1294,13 +1301,13 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown"
                 )
             else:
-                missing_names = result["missing_channel_names"]
                 missing_channels = result["missing_channels"]
+                missing_names = result["missing_channel_names"]
                 keyboard = []
                 
-                # Add buttons for missing channels with friendly names
+                # Add button for EVERY missing channel
                 for i, channel in enumerate(missing_channels):
-                    channel_name = missing_names[i] if i < len(missing_names) else f"Channel"
+                    channel_name = missing_names[i] if i < len(missing_names) else f"Channel {i+1}"
                     keyboard.append([InlineKeyboardButton(
                         f"📥 Join {channel_name}", 
                         url=f"https://t.me/{channel}"
@@ -1314,8 +1321,11 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 if len(missing_names) == 1:
                     text = f"❌ *Missing {missing_names[0]}*"
+                elif len(missing_names) == 2:
+                    text = f"❌ *Missing {missing_names[0]} and {missing_names[1]}*"
                 else:
-                    text = "❌ *Not a member of required channels*"
+                    channels_text = ", ".join(missing_names[:-1]) + f" and {missing_names[-1]}"
+                    text = f"❌ *Missing {channels_text}*"
 
                 await query.edit_message_text(
                     text,
@@ -1332,17 +1342,16 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("❌ File not found")
                 return
 
-            # FORCE CHECK membership with latest channels
             result = await check_membership(user_id, context, force_check=True)
 
             if not result['all_joined']:
-                missing_names = result["missing_channel_names"]
                 missing_channels = result["missing_channels"]
+                missing_names = result["missing_channel_names"]
                 keyboard = []
                 
-                # Add buttons for missing channels with friendly names
+                # Add button for EVERY missing channel
                 for i, channel in enumerate(missing_channels):
-                    channel_name = missing_names[i] if i < len(missing_names) else f"Channel"
+                    channel_name = missing_names[i] if i < len(missing_names) else f"Channel {i+1}"
                     keyboard.append([InlineKeyboardButton(
                         f"📥 Join {channel_name}", 
                         url=f"https://t.me/{channel}"
@@ -1356,8 +1365,11 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 if len(missing_names) == 1:
                     text = f"❌ *Join {missing_names[0]}*"
+                elif len(missing_names) == 2:
+                    text = f"❌ *Join {missing_names[0]} and {missing_names[1]}*"
                 else:
-                    text = "❌ *Join all required channels*"
+                    channels_text = ", ".join(missing_names[:-1]) + f" and {missing_names[-1]}"
+                    text = f"❌ *Join {channels_text}*"
 
                 await query.edit_message_text(
                     text,
@@ -1366,7 +1378,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-            # User has joined all channels - send file
+            # Send file
             await db.update_user_interaction(user_id=user_id, file_accessed=True)
 
             try:
@@ -1595,7 +1607,7 @@ async def testchannels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result_text = "🔍 *Channel Access Test*\n\n" + "\n".join(results)
     
     await status_msg.edit_text(result_text, parse_mode="Markdown")
-    await schedule_message_deletion(context, status_msg.chat_id, sent_msg.message_id)
+    await schedule_message_deletion(context, status_msg.chat_id, status_msg.message_id)
 
 # ============ EXISTING COMMAND HANDLERS ============
 async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2214,14 +2226,14 @@ async def main_async():
 def main():
     """Main function"""
     print("\n" + "=" * 60)
-    print("🤖 TELEGRAM FILE BOT - FIXED: File Links Check All Channels")
+    print("🤖 TELEGRAM FILE BOT - FIXED: Shows ALL Missing Channel Buttons")
     print("=" * 60)
     print(f"✅ Bot: @{bot_username}")
     print(f"✅ Admin: {ADMIN_ID}")
     print(f"✅ Database: Render PostgreSQL")
     print(f"✅ Auto Cleanup: DISABLED (Permanent storage)")
     print(f"✅ Storage: Metadata only (Files on Telegram)")
-    print(f"✅ Channel Checking: Works for BOTH /start and file links")
+    print(f"✅ Channel Checking: Shows buttons for ALL missing channels")
     print(f"✅ Python Version: {sys.version}")
     print("=" * 60 + "\n")
 
