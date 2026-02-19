@@ -479,16 +479,70 @@ class Database:
             rows = await self.fetchall("SELECT user_id FROM users")
         return [row['user_id'] for row in rows]
 
-    async def get_user_count(self) -> int:
-        """Get total number of users."""
-        result = await self.fetchrow("SELECT COUNT(*) as count FROM users")
-        return result['count'] if result else 0
+   async def get_user_count(self) -> int:
+    """Get total number of users."""
+    result = await self.fetchrow("SELECT COUNT(*) as count FROM users")
+    return result['count'] if result else 0
 
-    async def close_pool(self):
-        """Close all connections in the pool."""
-        if self.pool:
-            self.pool.closeall()
-            log.info("Database connection pool closed")
+async def get_database_size(self) -> Dict[str, Any]:
+    """Get actual PostgreSQL database size on disk"""
+    try:
+        # Get database size in bytes
+        result = await self.fetchrow("SELECT pg_database_size(current_database()) as size_bytes")
+        size_bytes = result['size_bytes'] if result else 0
+        
+        # Get table sizes breakdown
+        table_sizes = await self.fetchall('''
+            SELECT
+                relname as table_name,
+                pg_total_relation_size(relid) as total_bytes,
+                pg_relation_size(relid) as data_bytes,
+                pg_indexes_size(relid) as index_bytes
+            FROM pg_catalog.pg_statio_user_tables
+            ORDER BY total_bytes DESC
+        ''')
+        
+        # Format main size
+        if size_bytes < 1024:
+            size_formatted = f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:
+            size_formatted = f"{size_bytes / 1024:.2f} KB"
+        elif size_bytes < 1024 * 1024 * 1024:
+            size_formatted = f"{size_bytes / (1024 * 1024):.2f} MB"
+        else:
+            size_formatted = f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+        
+        # Format table sizes for details
+        tables = []
+        for row in table_sizes:
+            total = row['total_bytes']
+            if total < 1024 * 1024:
+                tables.append(f"  📄 {row['table_name']}: {total/1024:.2f} KB")
+            elif total < 1024 * 1024 * 1024:
+                tables.append(f"  📄 {row['table_name']}: {total/(1024*1024):.2f} MB")
+            else:
+                tables.append(f"  📄 {row['table_name']}: {total/(1024*1024*1024):.2f} GB")
+        
+        return {
+            'bytes': size_bytes,
+            'formatted': size_formatted,
+            'tables': tables,
+            'table_count': len(table_sizes)
+        }
+    except Exception as e:
+        log.error(f"Error getting database size: {e}")
+        return {
+            'bytes': 0,
+            'formatted': 'Unknown',
+            'tables': [],
+            'table_count': 0
+        }
+
+async def close_pool(self):
+    """Close all connections in the pool."""
+    if self.pool:
+        self.pool.closeall()
+        log.info("Database connection pool closed")
 
 # Initialize database
 db = Database()
@@ -1153,53 +1207,53 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_count = await db.get_file_count()
     user_count = await db.get_user_count()
 
-    # Get total accesses and total storage used
+    # Get total accesses and database storage info
     files = await db.get_all_files()
     total_access = sum(f[5] for f in files) if files else 0
-    total_size_bytes = sum(f[3] for f in files) if files else 0  # f[3] is file_size
     
-    # Format total size in human-readable format
-    if total_size_bytes < 1024:
-        total_size = f"{total_size_bytes} B"
-    elif total_size_bytes < 1024 * 1024:
-        total_size = f"{total_size_bytes / 1024:.2f} KB"
-    elif total_size_bytes < 1024 * 1024 * 1024:
-        total_size = f"{total_size_bytes / (1024 * 1024):.2f} MB"
-    else:
-        total_size = f"{total_size_bytes / (1024 * 1024 * 1024):.2f} GB"
+    # Get actual PostgreSQL database size
+    db_size_info = await db.get_database_size()
 
     # Escape underscores in bot_username for Markdown
     escaped_bot_username = bot_username.replace("_", "\\_")
 
     try:
-        sent_msg = await update.message.reply_text(
+        message = (
             f"📊 *Bot Statistics*\n\n"
             f"🤖 Bot: @{escaped_bot_username}\n"
             f"⏱ Uptime: {uptime}\n"
             f"📁 Files: {file_count}\n"
-            f"💾 Storage Used: {total_size}\n"
+            f"💾 PostgreSQL DB Size: *{db_size_info['formatted']}*\n"
             f"👥 Users: {user_count}\n"
-            f"👀 Accesses: {total_access}\n"
+            f"👀 Total Accesses: {total_access}\n"
             f"💾 Database: PostgreSQL (permanent)\n"
-            f"⏰ Auto-delete: {DELETE_AFTER//60} minutes",
-            parse_mode="Markdown"
+            f"⏰ Auto-delete: {DELETE_AFTER//60} minutes"
         )
+        
+        # Add table breakdown if available (optional, can be removed if too detailed)
+        if db_size_info['tables'] and len(db_size_info['tables']) > 0:
+            message += f"\n\n📋 *Table Sizes:*\n"
+            message += "\n".join(db_size_info['tables'][:3])  # Show top 3 tables
+        
+        sent_msg = await update.message.reply_text(message, parse_mode="Markdown")
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        
     except Exception as e:
         log.error(f"Error in stats command: {e}", exc_info=True)
         # Fallback to plain text
         try:
-            sent_msg = await update.message.reply_text(
+            message = (
                 f"📊 Bot Statistics\n\n"
                 f"🤖 Bot: @{bot_username}\n"
                 f"⏱ Uptime: {uptime}\n"
                 f"📁 Files: {file_count}\n"
-                f"💾 Storage Used: {total_size}\n"
+                f"💾 PostgreSQL DB Size: {db_size_info['formatted']}\n"
                 f"👥 Users: {user_count}\n"
-                f"👀 Accesses: {total_access}\n"
+                f"👀 Total Accesses: {total_access}\n"
                 f"💾 Database: PostgreSQL (permanent)\n"
                 f"⏰ Auto-delete: {DELETE_AFTER//60} minutes"
             )
+            sent_msg = await update.message.reply_text(message)
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         except Exception as e2:
             log.error(f"Even fallback failed: {e2}")
