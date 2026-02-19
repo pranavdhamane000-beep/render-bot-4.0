@@ -290,9 +290,9 @@ class Database:
                     return cur.rowcount
             return await asyncio.to_thread(_execute)
 
-    # ============ NEW: Get database storage usage ============
+    # ============ Get database storage usage (REAL PostgreSQL size) ============
     async def get_db_storage_usage(self) -> Dict[str, Any]:
-        """Get PostgreSQL database storage usage"""
+        """Get PostgreSQL database storage usage (REAL disk usage)"""
         try:
             # Query to get database size
             result = await self.fetchrow('''
@@ -311,11 +311,14 @@ class Database:
                 
                 # Convert to human readable format
                 def format_bytes(bytes_val):
-                    for unit in ['B', 'KB', 'MB', 'GB']:
-                        if bytes_val < 1024.0:
-                            return f"{bytes_val:.2f} {unit}"
-                        bytes_val /= 1024.0
-                    return f"{bytes_val:.2f} TB"
+                    if bytes_val < 1024:
+                        return f"{bytes_val} B"
+                    elif bytes_val < 1024 * 1024:
+                        return f"{bytes_val/1024:.2f} KB"
+                    elif bytes_val < 1024 * 1024 * 1024:
+                        return f"{bytes_val/(1024*1024):.2f} MB"
+                    else:
+                        return f"{bytes_val/(1024*1024*1024):.2f} GB"
                 
                 return {
                     'total': format_bytes(total_bytes),
@@ -334,6 +337,58 @@ class Database:
             'tables': 'Unknown',
             'indexes': 'Unknown'
         }
+
+    # ============ Get metadata storage info ============
+    async def get_metadata_storage_info(self) -> Dict[str, Any]:
+        """Get detailed metadata storage info (what's actually in DB)"""
+        try:
+            # Get row counts for main tables
+            files_count = await self.get_file_count()
+            users_count = await self.get_user_count()
+            
+            # Get cache size
+            cache_result = await self.fetchrow("SELECT COUNT(*) as count FROM membership_cache")
+            cache_count = cache_result['count'] if cache_result else 0
+            
+            # Get channels count
+            channels_count = await self.get_channel_count()
+            
+            # Estimate metadata size (approximate)
+            # Each file record ~200 bytes, each user ~150 bytes, each cache entry ~50 bytes
+            estimated_metadata_bytes = (files_count * 200) + (users_count * 150) + (cache_count * 50) + (channels_count * 100)
+            
+            def format_bytes(bytes_val):
+                if bytes_val < 1024:
+                    return f"{bytes_val} B"
+                elif bytes_val < 1024 * 1024:
+                    return f"{bytes_val/1024:.2f} KB"
+                else:
+                    return f"{bytes_val/(1024*1024):.2f} MB"
+            
+            return {
+                'files_count': files_count,
+                'users_count': users_count,
+                'cache_entries': cache_count,
+                'channels_count': channels_count,
+                'estimated_metadata': format_bytes(estimated_metadata_bytes),
+                'estimated_bytes': estimated_metadata_bytes
+            }
+        except Exception as e:
+            log.error(f"Error getting metadata info: {e}")
+            return {
+                'files_count': 0,
+                'users_count': 0,
+                'cache_entries': 0,
+                'channels_count': 0,
+                'estimated_metadata': 'Unknown',
+                'estimated_bytes': 0
+            }
+
+    # ============ Get total size of files uploaded (for info only) ============
+    async def get_total_uploaded_size(self) -> int:
+        """Get total size of all files uploaded (sum of file_size column)"""
+        result = await self.fetchrow("SELECT COALESCE(SUM(file_size), 0) as total FROM files")
+        return result['total'] if result else 0
 
     # ============ Channel management methods ============
     async def get_required_channels(self, active_only: bool = True) -> List[str]:
@@ -533,11 +588,6 @@ class Database:
         ''')
         # Return as list of tuples for compatibility with original code
         return [(row['id'], row['file_name'], row['is_video'], row['file_size'], row['timestamp'], row['access_count']) for row in rows]
-
-    async def get_total_storage_used(self) -> int:
-        """Get total storage used by files in bytes"""
-        result = await self.fetchrow("SELECT COALESCE(SUM(file_size), 0) as total FROM files")
-        return result['total'] if result else 0
 
     async def schedule_message_deletion(self, chat_id: int, message_id: int):
         """Schedule a message for deletion."""
@@ -920,7 +970,7 @@ def home():
             <p>Files in DB: {{ file_count }}</p>
             <p>Users in DB: {{ user_count }}</p>
             <p>Required Channels: {{ channel_count }}</p>
-            <p>📁 Storage: PERMANENT (No auto cleanup)</p>
+            <p>📁 Storage: Metadata only (files stored on Telegram)</p>
         </div>
 
         <div class="info">
@@ -929,7 +979,7 @@ def home():
                 <li>Bot: <strong>@{{ bot_username }}</strong></li>
                 <li>Database: <strong>Render PostgreSQL</strong></li>
                 <li>Driver: <strong>psycopg2-binary</strong></li>
-                <li>Storage: <strong>PERMANENT - No auto cleanup</strong></li>
+                <li>Storage: <strong>Metadata only - Files on Telegram</strong></li>
                 <li>Message Auto-delete: <strong>{{ delete_minutes }} minutes</strong></li>
                 <li>Dynamic Channels: <strong>Yes (Add/Remove anytime)</strong></li>
             </ul>
@@ -992,7 +1042,7 @@ def health():
         "uptime": str(timedelta(seconds=int(time.time() - start_time))),
         "database": "postgresql",
         "driver": "psycopg2-binary",
-        "storage": "permanent",
+        "storage": "metadata_only",
         "auto_cleanup": False,
         "file_count": file_count,
         "user_count": user_count,
@@ -1120,7 +1170,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{channel_list}\n"
                 "3️⃣ Click 'Check Membership'\n\n"
                 f"⚠️ Messages auto-delete after {DELETE_AFTER//60} minutes\n"
-                "💾 *Storage:* PERMANENT (No auto cleanup)\n"
+                "💾 *Storage:* Metadata only (files stored on Telegram)\n"
                 "📢 *Dynamic Channels:* Add/remove anytime by admin",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
@@ -1178,7 +1228,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filename = file_info['file_name']
             ext = filename.lower().split('.')[-1] if '.' in filename else ""
 
-            warning = f"\n\n⚠️ Auto-deletes in {DELETE_AFTER//60} minutes\n💾 Permanently stored (no auto cleanup)"
+            warning = f"\n\n⚠️ Auto-deletes in {DELETE_AFTER//60} minutes\n💾 Metadata stored in DB (file on Telegram)"
 
             if file_info['is_video'] and ext in PLAYABLE_EXTS:
                 sent = await context.bot.send_video(
@@ -1319,7 +1369,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 filename = file_info['file_name']
                 ext = filename.lower().split('.')[-1] if '.' in filename else ""
 
-                warning = f"\n\n⚠️ Auto-deletes in {DELETE_AFTER//60} minutes\n💾 Permanently stored (no auto cleanup)"
+                warning = f"\n\n⚠️ Auto-deletes in {DELETE_AFTER//60} minutes\n💾 Metadata stored in DB (file on Telegram)"
                 chat_id = query.message.chat_id
 
                 if file_info['is_video'] and ext in PLAYABLE_EXTS:
@@ -1357,7 +1407,7 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         sent_msg = await update.message.reply_text(
             "❌ Usage: /addchannel <channel username> [friendly name]\n"
-            "Example: /addchannel @my_channel \"My Awesome Channel\""
+            "Example: /addchannel @my_channel \"1\""
         )
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
@@ -1593,7 +1643,7 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ *Upload Successful*\n\n"
             f"📁 *Name:* `{filename}`\n"
             f"🔑 *Key:* `{key}`\n"
-            f"💾 *Storage:* PERMANENT (No auto cleanup)\n\n"
+            f"💾 *Storage:* Metadata only (file stored on Telegram)\n\n"
             f"🔗 *Link:*\n`{link}`",
             parse_mode="Markdown"
         )
@@ -1605,7 +1655,7 @@ async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stats command (admin only) - NOW WITH DATABASE STORAGE USAGE"""
+    """Stats command (admin only) - Shows REAL database storage"""
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -1614,21 +1664,27 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_count = await db.get_user_count()
     channel_count = await db.get_channel_count()
 
-    # Get total file storage
-    total_file_bytes = await db.get_total_storage_used()
-    
-    # Get database storage usage
+    # Get database storage usage (REAL PostgreSQL size)
     db_storage = await db.get_db_storage_usage()
     
-    # Format file storage
-    def format_bytes(bytes_val):
-        for unit in ['B', 'KB', 'MB', 'GB']:
-            if bytes_val < 1024.0:
-                return f"{bytes_val:.2f} {unit}"
-            bytes_val /= 1024.0
-        return f"{bytes_val:.2f} TB"
+    # Get metadata storage info
+    metadata_info = await db.get_metadata_storage_info()
     
-    file_storage = format_bytes(total_file_bytes)
+    # Get total size of files uploaded (for information only)
+    total_uploaded_bytes = await db.get_total_uploaded_size()
+    
+    # Format bytes to human readable
+    def format_bytes(bytes_val):
+        if bytes_val < 1024:
+            return f"{bytes_val} B"
+        elif bytes_val < 1024 * 1024:
+            return f"{bytes_val/1024:.2f} KB"
+        elif bytes_val < 1024 * 1024 * 1024:
+            return f"{bytes_val/(1024*1024):.2f} MB"
+        else:
+            return f"{bytes_val/(1024*1024*1024):.2f} GB"
+    
+    total_uploaded = format_bytes(total_uploaded_bytes)
 
     # Get total accesses
     files = await db.get_all_files()
@@ -1641,15 +1697,19 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_msg = await update.message.reply_text(
             f"📊 *Bot Statistics*\n\n"
             f"🤖 Bot: @{escaped_bot_username}\n"
-            f"⏱ Uptime: {uptime}\n"
-            f"📁 Files: {file_count}\n"
-            f"📦 File Storage: {file_storage}\n"
-            f"💾 PostgreSQL: {db_storage['total']}\n"
+            f"⏱ Uptime: {uptime}\n\n"
+            f"📁 *Files:* {file_count}\n"
+            f"📦 *Total Uploaded:* {total_uploaded} (on Telegram)\n"
+            f"👥 *Users:* {user_count}\n"
+            f"📢 *Required Channels:* {channel_count}\n"
+            f"👀 *Total Accesses:* {total_access}\n\n"
+            f"💾 *PostgreSQL Storage (REAL):*\n"
+            f"   ├─ Total DB: {db_storage['total']}\n"
             f"   ├─ Tables: {db_storage['tables']}\n"
-            f"   └─ Indexes: {db_storage['indexes']}\n"
-            f"👥 Users: {user_count}\n"
-            f"📢 Required Channels: {channel_count}\n"
-            f"👀 Total Accesses: {total_access}\n"
+            f"   └─ Indexes: {db_storage['indexes']}\n\n"
+            f"📊 *Metadata Stats:*\n"
+            f"   ├─ Cache Entries: {metadata_info['cache_entries']}\n"
+            f"   └─ Est. Metadata: {metadata_info['estimated_metadata']}\n\n"
             f"⏰ Auto-delete: {DELETE_AFTER//60} minutes\n"
             f"🧹 Auto Cleanup: DISABLED (Permanent storage)",
             parse_mode="Markdown"
@@ -1664,11 +1724,11 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🤖 Bot: @{bot_username}\n"
                 f"⏱ Uptime: {uptime}\n"
                 f"📁 Files: {file_count}\n"
-                f"📦 File Storage: {file_storage}\n"
-                f"💾 Database: {db_storage['total']}\n"
+                f"📦 Total Uploaded: {total_uploaded} (on Telegram)\n"
                 f"👥 Users: {user_count}\n"
                 f"📢 Required Channels: {channel_count}\n"
                 f"👀 Accesses: {total_access}\n"
+                f"💾 PostgreSQL: {db_storage['total']}\n"
                 f"⏰ Auto-delete: {DELETE_AFTER//60} minutes\n"
                 f"🧹 Auto Cleanup: DISABLED"
             )
@@ -2031,33 +2091,6 @@ async def testchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent_msg = await update.message.reply_text(result_text, parse_mode="Markdown")
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
-# REMOVED AUTO CLEANUP COMMAND - Now manual only
-# async def cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     """Manual cleanup (admin only)"""
-#     if update.effective_user.id != ADMIN_ID:
-#         return
-#
-#     days = 30
-#     if context.args:
-#         try:
-#             days = int(context.args[0])
-#         except:
-#             pass
-#
-#     result = await db.execute_and_commit('''
-#         DELETE FROM files
-#         WHERE timestamp < CURRENT_TIMESTAMP - INTERVAL '1 day' * %s
-#     ''', (days,))
-#
-#     file_count = await db.get_file_count()
-#
-#     sent_msg = await update.message.reply_text(
-#         f"🧹 Cleaned files older than {days} days\n"
-#         f"📁 Files remaining: {file_count}",
-#         parse_mode="Markdown"
-#     )
-#     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-
 # ============ MAIN ============
 async def initialize_bot():
     """Initialize bot application"""
@@ -2107,8 +2140,6 @@ async def initialize_bot():
     application.add_handler(CommandHandler("broadcast", broadcast))
     application.add_handler(CommandHandler("clearcache", clearcache))
     application.add_handler(CommandHandler("testchannel", testchannel))
-    # REMOVED cleanup command - No auto cleanup
-    # application.add_handler(CommandHandler("cleanup", cleanup))
     
     # Channel management commands
     application.add_handler(CommandHandler("addchannel", addchannel))
@@ -2179,12 +2210,13 @@ async def main_async():
 def main():
     """Main function"""
     print("\n" + "=" * 60)
-    print("🤖 TELEGRAM FILE BOT - Enhanced UI + Storage Stats")
+    print("🤖 TELEGRAM FILE BOT - Accurate Storage Stats")
     print("=" * 60)
     print(f"✅ Bot: @{bot_username}")
     print(f"✅ Admin: {ADMIN_ID}")
     print(f"✅ Database: Render PostgreSQL")
     print(f"✅ Auto Cleanup: DISABLED (Permanent storage)")
+    print(f"✅ Storage: Metadata only (Files on Telegram)")
     print(f"✅ Python Version: {sys.version}")
     print("=" * 60 + "\n")
 
