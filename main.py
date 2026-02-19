@@ -1153,9 +1153,20 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_count = await db.get_file_count()
     user_count = await db.get_user_count()
 
-    # Get total accesses
+    # Get total accesses and total storage used
     files = await db.get_all_files()
     total_access = sum(f[5] for f in files) if files else 0
+    total_size_bytes = sum(f[3] for f in files) if files else 0  # f[3] is file_size
+    
+    # Format total size in human-readable format
+    if total_size_bytes < 1024:
+        total_size = f"{total_size_bytes} B"
+    elif total_size_bytes < 1024 * 1024:
+        total_size = f"{total_size_bytes / 1024:.2f} KB"
+    elif total_size_bytes < 1024 * 1024 * 1024:
+        total_size = f"{total_size_bytes / (1024 * 1024):.2f} MB"
+    else:
+        total_size = f"{total_size_bytes / (1024 * 1024 * 1024):.2f} GB"
 
     # Escape underscores in bot_username for Markdown
     escaped_bot_username = bot_username.replace("_", "\\_")
@@ -1166,6 +1177,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🤖 Bot: @{escaped_bot_username}\n"
             f"⏱ Uptime: {uptime}\n"
             f"📁 Files: {file_count}\n"
+            f"💾 Storage Used: {total_size}\n"
             f"👥 Users: {user_count}\n"
             f"👀 Accesses: {total_access}\n"
             f"💾 Database: PostgreSQL (permanent)\n"
@@ -1182,6 +1194,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🤖 Bot: @{bot_username}\n"
                 f"⏱ Uptime: {uptime}\n"
                 f"📁 Files: {file_count}\n"
+                f"💾 Storage Used: {total_size}\n"
                 f"👥 Users: {user_count}\n"
                 f"👀 Accesses: {total_access}\n"
                 f"💾 Database: PostgreSQL (permanent)\n"
