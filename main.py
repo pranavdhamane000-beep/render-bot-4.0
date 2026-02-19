@@ -818,7 +818,10 @@ async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bo
     if not force_check:
         cached = await db.get_cached_membership(user_id, clean_channel)
         if cached is not None:
+            log.info(f"✅ CACHE HIT: User {user_id} in {clean_channel}: {cached}")
             return cached
+        else:
+            log.info(f"🔄 CACHE MISS: User {user_id} in {clean_channel}")
 
     try:
         if not channel.startswith("@"):
@@ -826,14 +829,18 @@ async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bo
         else:
             channel_username = channel
 
+        log.info(f"🔍 Checking user {user_id} in channel {channel_username}")
         member = await bot.get_chat_member(chat_id=channel_username, user_id=user_id)
         is_member = member.status in ["member", "administrator", "creator"]
+        log.info(f"✅ User {user_id} in {clean_channel}: {is_member} (status: {member.status})")
 
         await db.cache_membership(user_id, clean_channel, is_member)
         return is_member
 
     except Exception as e:
         error_msg = str(e).lower()
+        log.error(f"❌ Error checking user {user_id} in {clean_channel}: {error_msg}")
+        
         if "user not found" in error_msg or "user not participant" in error_msg:
             await db.cache_membership(user_id, clean_channel, False)
             return False
@@ -845,7 +852,6 @@ async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bo
             log.error(f"Bot can't access @{clean_channel}")
             return True
         else:
-            log.error(f"Unexpected error checking channel {clean_channel}: {e}")
             return True
 
 async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, force_check: bool = False) -> Dict[str, Any]:
@@ -860,16 +866,20 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
     }
 
     # Get all active required channels with details (ALWAYS fetch fresh from DB)
+    log.info(f"📋 Fetching active channels from database for user {user_id}")
     channels_data = await db.get_channels_with_details()
     active_channels = [c for c in channels_data if c['is_active'] == 1]
     
+    log.info(f"📋 Found {len(active_channels)} active channels: {[c['channel_username'] for c in active_channels]}")
+    
     if not active_channels:
         # No channels required - auto approve
+        log.info(f"✅ No channels required for user {user_id} - auto approving")
         result["all_joined"] = True
         return result
 
     if force_check:
-        # Clear cache for this user to force fresh checks
+        log.info(f"🔄 Force check - clearing cache for user {user_id}")
         await db.clear_membership_cache(user_id)
 
     # Check each channel
@@ -877,17 +887,24 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
         channel = channel_data['channel_username']
         channel_name = channel_data['channel_name'] or channel
         
+        log.info(f"🔍 Checking user {user_id} in channel @{channel} ({channel_name})")
         is_member = await check_user_in_channel(bot, channel, user_id, force_check)
+        
         result["channel_status"][channel] = {
             'is_member': is_member,
             'name': channel_name
         }
         
         if not is_member:
+            log.info(f"❌ User {user_id} NOT in channel @{channel}")
             result["missing_channels"].append(channel)
             result["missing_channel_names"].append(channel_name)
+        else:
+            log.info(f"✅ User {user_id} IS in channel @{channel}")
 
     result["all_joined"] = len(result["missing_channels"]) == 0
+    log.info(f"📊 Final result for user {user_id}: all_joined={result['all_joined']}, missing={result['missing_channel_names']}")
+    
     return result
 
 # ============ WEB ROUTES ============
@@ -1126,22 +1143,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         args = context.args
+        username = update.effective_user.username
+        first_name = update.effective_user.first_name
+
+        log.info(f"🚀 /start command from user {user_id} (@{username}) with args: {args}")
 
         # Update user interaction
-        user = update.effective_user
         await db.update_user_interaction(
-            user_id=user.id,
-            username=user.username,
-            first_name=user.first_name,
-            last_name=user.last_name
+            user_id=user_id,
+            username=username,
+            first_name=first_name,
+            last_name=update.effective_user.last_name
         )
 
         # ALWAYS fetch fresh channel list from database
+        log.info(f"📋 Fetching channels for user {user_id}")
         channels_data = await db.get_channels_with_details()
         active_channels = [c for c in channels_data if c['is_active'] == 1]
         
+        log.info(f"📋 Found {len(active_channels)} active channels: {[c['channel_username'] for c in active_channels]}")
+        
         # No file key - show welcome
         if not args:
+            log.info(f"👋 Showing welcome menu to user {user_id}")
             keyboard = []
             
             # Add buttons for each required channel with friendly names
@@ -1182,24 +1206,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ============ FILE KEY EXISTS - CHECK MEMBERSHIP ============
         key = args[0]
+        log.info(f"🔑 User {user_id} accessing file key: {key}")
+        
         file_info = await db.get_file(key)
 
         if not file_info:
+            log.warning(f"❌ File key {key} not found for user {user_id}")
             sent_msg = await update.message.reply_text("❌ File not found")
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
+        log.info(f"📁 File found: {file_info['file_name']}")
+
         # FORCE CHECK membership with latest channels (ignore cache)
+        log.info(f"🔍 Checking membership for user {user_id} (force=True)")
         result = await check_membership(user_id, context, force_check=True)
+
+        log.info(f"📊 Membership result: all_joined={result['all_joined']}, missing={result['missing_channel_names']}")
 
         if not result["all_joined"]:
             missing_channels = result["missing_channels"]  # List of channel usernames
             missing_names = result["missing_channel_names"]  # List of friendly names
             
+            log.info(f"🔒 User {user_id} missing {len(missing_names)} channels: {missing_names}")
+            
             # Create keyboard with buttons for EACH missing channel
             keyboard = []
             
-            # Add a button for EVERY missing channel (not just one!)
+            # Add a button for EVERY missing channel
             for i, channel in enumerate(missing_channels):
                 channel_name = missing_names[i] if i < len(missing_names) else f"Channel {i+1}"
                 keyboard.append([InlineKeyboardButton(
@@ -1222,6 +1256,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 channels_text = ", ".join(missing_names[:-1]) + f" and {missing_names[-1]}"
                 text = f"🔒 *Join {channels_text} to access this file*"
 
+            log.info(f"📨 Sending restriction message to user {user_id} with {len(keyboard)} buttons")
+            
             sent_msg = await update.message.reply_text(
                 text,
                 parse_mode="Markdown",
@@ -1231,6 +1267,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # User has joined all channels - send file
+        log.info(f"✅ User {user_id} has joined all channels. Sending file...")
         await db.update_user_interaction(user_id=user_id, file_accessed=True)
 
         try:
@@ -1240,6 +1277,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             warning = f"\n\n⚠️ Auto-deletes in {DELETE_AFTER//60} minutes\n💾 Metadata stored in DB (file on Telegram)"
 
             if file_info['is_video'] and ext in PLAYABLE_EXTS:
+                log.info(f"🎬 Sending video to user {user_id}: {filename}")
                 sent = await context.bot.send_video(
                     chat_id=chat_id,
                     video=file_info["file_id"],
@@ -1248,6 +1286,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     supports_streaming=True
                 )
             else:
+                log.info(f"📁 Sending document to user {user_id}: {filename}")
                 sent = await context.bot.send_document(
                     chat_id=chat_id,
                     document=file_info["file_id"],
@@ -1256,14 +1295,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
             await schedule_message_deletion(context, sent.chat_id, sent.message_id)
+            log.info(f"✅ File sent successfully to user {user_id}")
 
         except Exception as e:
-            log.error(f"Error sending file: {e}")
+            log.error(f"❌ Error sending file to user {user_id}: {e}", exc_info=True)
             sent_msg = await update.message.reply_text("❌ Failed to send file")
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
     except Exception as e:
-        log.error(f"Start error: {e}", exc_info=True)
+        log.error(f"❌ Start error: {e}", exc_info=True)
 
 # ============ FIXED CHECK JOIN - Shows ALL missing channels ============
 async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1274,6 +1314,9 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         user_id = query.from_user.id
         data = query.data
+        username = query.from_user.username
+
+        log.info(f"🔄 Callback query from user {user_id} (@{username}): {data}")
 
         # Update user interaction
         user = query.from_user
@@ -1285,6 +1328,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if data == "check_membership":
+            log.info(f"🔍 Checking membership for user {user_id} from callback")
             result = await check_membership(user_id, context, force_check=True)
 
             if result["all_joined"]:
@@ -1294,6 +1338,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 channel_list = "\n".join([f"✅ {c['channel_name'] or f'Channel {i+1}'}" for i, c in enumerate(active_channels)])
                 
+                log.info(f"✅ User {user_id} has joined all channels")
                 await query.edit_message_text(
                     f"✅ *You've joined all required channels!*\n\n"
                     f"{channel_list}\n\n"
@@ -1303,6 +1348,9 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 missing_channels = result["missing_channels"]
                 missing_names = result["missing_channel_names"]
+                
+                log.info(f"❌ User {user_id} missing channels: {missing_names}")
+                
                 keyboard = []
                 
                 # Add button for EVERY missing channel
@@ -1336,9 +1384,11 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data.startswith("check|"):
             _, key = data.split("|")
+            log.info(f"🔑 Check again for file {key} from user {user_id}")
 
             file_info = await db.get_file(key)
             if not file_info:
+                log.warning(f"❌ File {key} not found")
                 await query.edit_message_text("❌ File not found")
                 return
 
@@ -1347,6 +1397,9 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not result['all_joined']:
                 missing_channels = result["missing_channels"]
                 missing_names = result["missing_channel_names"]
+                
+                log.info(f"❌ User {user_id} still missing channels: {missing_names}")
+                
                 keyboard = []
                 
                 # Add button for EVERY missing channel
@@ -1378,7 +1431,8 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-            # Send file
+            # User has joined all channels - send file
+            log.info(f"✅ User {user_id} now joined all channels. Sending file...")
             await db.update_user_interaction(user_id=user_id, file_accessed=True)
 
             try:
@@ -1389,6 +1443,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id = query.message.chat_id
 
                 if file_info['is_video'] and ext in PLAYABLE_EXTS:
+                    log.info(f"🎬 Sending video to user {user_id}: {filename}")
                     sent = await context.bot.send_video(
                         chat_id=chat_id,
                         video=file_info["file_id"],
@@ -1397,6 +1452,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         supports_streaming=True
                     )
                 else:
+                    log.info(f"📁 Sending document to user {user_id}: {filename}")
                     sent = await context.bot.send_document(
                         chat_id=chat_id,
                         document=file_info["file_id"],
@@ -1408,11 +1464,11 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await schedule_message_deletion(context, sent.chat_id, sent.message_id)
 
             except Exception as e:
-                log.error(f"Failed to send file: {e}")
+                log.error(f"❌ Failed to send file to user {user_id}: {e}", exc_info=True)
                 await query.edit_message_text("❌ Failed to send file")
 
     except Exception as e:
-        log.error(f"Callback error: {e}", exc_info=True)
+        log.error(f"❌ Callback error: {e}", exc_info=True)
 
 # ============ CHANNEL MANAGEMENT COMMANDS ============
 async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2226,14 +2282,14 @@ async def main_async():
 def main():
     """Main function"""
     print("\n" + "=" * 60)
-    print("🤖 TELEGRAM FILE BOT - FIXED: Shows ALL Missing Channel Buttons")
+    print("🤖 TELEGRAM FILE BOT - DEBUG VERSION - Shows ALL Missing Channels")
     print("=" * 60)
     print(f"✅ Bot: @{bot_username}")
     print(f"✅ Admin: {ADMIN_ID}")
     print(f"✅ Database: Render PostgreSQL")
     print(f"✅ Auto Cleanup: DISABLED (Permanent storage)")
     print(f"✅ Storage: Metadata only (Files on Telegram)")
-    print(f"✅ Channel Checking: Shows buttons for ALL missing channels")
+    print(f"✅ DEBUG MODE: Extensive logging enabled")
     print(f"✅ Python Version: {sys.version}")
     print("=" * 60 + "\n")
 
