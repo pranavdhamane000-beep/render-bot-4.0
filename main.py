@@ -479,7 +479,7 @@ class Database:
             rows = await self.fetchall("SELECT user_id FROM users")
         return [row['user_id'] for row in rows]
 
-   async def get_user_count(self) -> int:
+async def get_user_count(self) -> int:
     """Get total number of users."""
     result = await self.fetchrow("SELECT COUNT(*) as count FROM users")
     return result['count'] if result else 0
