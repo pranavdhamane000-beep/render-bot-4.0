@@ -479,70 +479,16 @@ class Database:
             rows = await self.fetchall("SELECT user_id FROM users")
         return [row['user_id'] for row in rows]
 
-async def get_user_count(self) -> int:
-    """Get total number of users."""
-    result = await self.fetchrow("SELECT COUNT(*) as count FROM users")
-    return result['count'] if result else 0
+    async def get_user_count(self) -> int:
+        """Get total number of users."""
+        result = await self.fetchrow("SELECT COUNT(*) as count FROM users")
+        return result['count'] if result else 0
 
-async def get_database_size(self) -> Dict[str, Any]:
-    """Get actual PostgreSQL database size on disk"""
-    try:
-        # Get database size in bytes
-        result = await self.fetchrow("SELECT pg_database_size(current_database()) as size_bytes")
-        size_bytes = result['size_bytes'] if result else 0
-        
-        # Get table sizes breakdown
-        table_sizes = await self.fetchall('''
-            SELECT
-                relname as table_name,
-                pg_total_relation_size(relid) as total_bytes,
-                pg_relation_size(relid) as data_bytes,
-                pg_indexes_size(relid) as index_bytes
-            FROM pg_catalog.pg_statio_user_tables
-            ORDER BY total_bytes DESC
-        ''')
-        
-        # Format main size
-        if size_bytes < 1024:
-            size_formatted = f"{size_bytes} B"
-        elif size_bytes < 1024 * 1024:
-            size_formatted = f"{size_bytes / 1024:.2f} KB"
-        elif size_bytes < 1024 * 1024 * 1024:
-            size_formatted = f"{size_bytes / (1024 * 1024):.2f} MB"
-        else:
-            size_formatted = f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
-        
-        # Format table sizes for details
-        tables = []
-        for row in table_sizes:
-            total = row['total_bytes']
-            if total < 1024 * 1024:
-                tables.append(f"  📄 {row['table_name']}: {total/1024:.2f} KB")
-            elif total < 1024 * 1024 * 1024:
-                tables.append(f"  📄 {row['table_name']}: {total/(1024*1024):.2f} MB")
-            else:
-                tables.append(f"  📄 {row['table_name']}: {total/(1024*1024*1024):.2f} GB")
-        
-        return {
-            'bytes': size_bytes,
-            'formatted': size_formatted,
-            'tables': tables,
-            'table_count': len(table_sizes)
-        }
-    except Exception as e:
-        log.error(f"Error getting database size: {e}")
-        return {
-            'bytes': 0,
-            'formatted': 'Unknown',
-            'tables': [],
-            'table_count': 0
-        }
-
-async def close_pool(self):
-    """Close all connections in the pool."""
-    if self.pool:
-        self.pool.closeall()
-        log.info("Database connection pool closed")
+    async def close_pool(self):
+        """Close all connections in the pool."""
+        if self.pool:
+            self.pool.closeall()
+            log.info("Database connection pool closed")
 
 # Initialize database
 db = Database()
@@ -1207,53 +1153,40 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_count = await db.get_file_count()
     user_count = await db.get_user_count()
 
-    # Get total accesses and database storage info
+    # Get total accesses
     files = await db.get_all_files()
     total_access = sum(f[5] for f in files) if files else 0
-    
-    # Get actual PostgreSQL database size
-    db_size_info = await db.get_database_size()
 
     # Escape underscores in bot_username for Markdown
     escaped_bot_username = bot_username.replace("_", "\\_")
 
     try:
-        message = (
+        sent_msg = await update.message.reply_text(
             f"📊 *Bot Statistics*\n\n"
             f"🤖 Bot: @{escaped_bot_username}\n"
             f"⏱ Uptime: {uptime}\n"
             f"📁 Files: {file_count}\n"
-            f"💾 PostgreSQL DB Size: *{db_size_info['formatted']}*\n"
             f"👥 Users: {user_count}\n"
-            f"👀 Total Accesses: {total_access}\n"
+            f"👀 Accesses: {total_access}\n"
             f"💾 Database: PostgreSQL (permanent)\n"
-            f"⏰ Auto-delete: {DELETE_AFTER//60} minutes"
+            f"⏰ Auto-delete: {DELETE_AFTER//60} minutes",
+            parse_mode="Markdown"
         )
-        
-        # Add table breakdown if available (optional, can be removed if too detailed)
-        if db_size_info['tables'] and len(db_size_info['tables']) > 0:
-            message += f"\n\n📋 *Table Sizes:*\n"
-            message += "\n".join(db_size_info['tables'][:3])  # Show top 3 tables
-        
-        sent_msg = await update.message.reply_text(message, parse_mode="Markdown")
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-        
     except Exception as e:
         log.error(f"Error in stats command: {e}", exc_info=True)
         # Fallback to plain text
         try:
-            message = (
+            sent_msg = await update.message.reply_text(
                 f"📊 Bot Statistics\n\n"
                 f"🤖 Bot: @{bot_username}\n"
                 f"⏱ Uptime: {uptime}\n"
                 f"📁 Files: {file_count}\n"
-                f"💾 PostgreSQL DB Size: {db_size_info['formatted']}\n"
                 f"👥 Users: {user_count}\n"
-                f"👀 Total Accesses: {total_access}\n"
+                f"👀 Accesses: {total_access}\n"
                 f"💾 Database: PostgreSQL (permanent)\n"
                 f"⏰ Auto-delete: {DELETE_AFTER//60} minutes"
             )
-            sent_msg = await update.message.reply_text(message)
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         except Exception as e2:
             log.error(f"Even fallback failed: {e2}")
@@ -1316,21 +1249,34 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent_msg = await update.message.reply_text(msg, parse_mode="Markdown")
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
+# ============ ENHANCED BROADCAST FEATURE ============
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Broadcast to users (admin only)"""
+    """Broadcast to users (admin only) - Auto chunk processing with 1000 users per batch"""
     if update.effective_user.id != ADMIN_ID:
         return
 
     if not context.args and not update.message.reply_to_message:
-        sent_msg = await update.message.reply_text("❌ Usage: /broadcast <message> or reply with /broadcast")
+        sent_msg = await update.message.reply_text(
+            "❌ Usage: /broadcast <message> or reply with /broadcast\n"
+            "Optional: /broadcast --preview to see preview only\n"
+            "Bot will auto-send in chunks of 1000 users"
+        )
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
 
-    # Get message text
-    if update.message.reply_to_message:
-        message_text = update.message.reply_to_message.text or update.message.reply_to_message.caption
+    # Check for preview mode
+    preview_mode = False
+    args_list = context.args if context.args else []
+    
+    if args_list and args_list[0] == "--preview":
+        preview_mode = True
+        message_text = " ".join(args_list[1:]) if len(args_list) > 1 else ""
     else:
-        message_text = " ".join(context.args)
+        # Get message text
+        if update.message.reply_to_message:
+            message_text = update.message.reply_to_message.text or update.message.reply_to_message.caption
+        else:
+            message_text = " ".join(args_list) if args_list else ""
 
     if not message_text:
         sent_msg = await update.message.reply_text("❌ Message cannot be empty")
@@ -1338,34 +1284,219 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Get all users
-    user_ids = await db.get_all_user_ids(exclude_admin=True)
-
     status_msg = await update.message.reply_text(
-        f"🔄 Broadcasting to {len(user_ids)} users...",
+        "📊 Fetching user list...",
         parse_mode="Markdown"
     )
 
+    user_ids = await db.get_all_user_ids(exclude_admin=True)
+    total_users = len(user_ids)
+
+    if total_users == 0:
+        await status_msg.edit_text("❌ No users found to broadcast")
+        return
+
+    # Preview mode - show sample
+    if preview_mode:
+        preview_text = f"🔍 *BROADCAST PREVIEW*\n\n"
+        preview_text += f"📝 *Message:*\n{message_text[:200]}{'...' if len(message_text) > 200 else ''}\n\n"
+        preview_text += f"👥 *Total users:* {total_users}\n"
+        preview_text += f"📦 *Chunks:* {(total_users + 999) // 1000} chunks of 1000\n\n"
+        preview_text += f"*First 5 users:*\n"
+        
+        for i, uid in enumerate(user_ids[:5]):
+            preview_text += f"{i+1}. `{uid}`\n"
+        
+        keyboard = [[
+            InlineKeyboardButton("✅ Confirm Broadcast", callback_data=f"confirm_broadcast|{total_users}"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel_broadcast")
+        ]]
+        
+        await status_msg.edit_text(
+            preview_text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+        # Store message text in context for later use
+        context.chat_data['broadcast_message'] = message_text
+        return
+
+    # Direct broadcast without preview
+    await status_msg.edit_text(
+        f"🔄 Starting broadcast to {total_users} users...\n"
+        f"📦 Processing in chunks of 1000 users"
+    )
+    
+    # Start the broadcast process
+    asyncio.create_task(process_broadcast_chunks(context, user_ids, message_text, status_msg))
+
+async def process_broadcast_chunks(context: ContextTypes.DEFAULT_TYPE, user_ids: list, message_text: str, status_msg: Message):
+    """Process broadcast in chunks of 1000 users"""
+    CHUNK_SIZE = 1000
+    total_users = len(user_ids)
+    total_chunks = (total_users + CHUNK_SIZE - 1) // CHUNK_SIZE
+    
     successful = 0
     failed = 0
+    blocked = 0
+    chunk_results = []
+    
+    start_time = time.time()
+    
+    for chunk_num in range(total_chunks):
+        chunk_start = chunk_num * CHUNK_SIZE
+        chunk_end = min((chunk_num + 1) * CHUNK_SIZE, total_users)
+        chunk_users = user_ids[chunk_start:chunk_end]
+        
+        chunk_success = 0
+        chunk_failed = 0
+        chunk_blocked = 0
+        
+        # Update status for current chunk
+        await status_msg.edit_text(
+            f"📦 *Processing Chunk {chunk_num + 1}/{total_chunks}*\n"
+            f"👥 Users in this chunk: {len(chunk_users)}\n"
+            f"✅ Sent so far: {successful}\n"
+            f"❌ Failed: {failed}\n"
+            f"🚫 Blocked: {blocked}\n"
+            f"⏱️ Chunk {chunk_num + 1} starting...",
+            parse_mode="Markdown"
+        )
+        
+        # Process current chunk
+        for i, user_id in enumerate(chunk_users):
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"📢 *Broadcast Message*\n\n{message_text}",
+                    parse_mode="Markdown"
+                )
+                chunk_success += 1
+                successful += 1
+                
+                # Update progress every 100 users within chunk
+                if (i + 1) % 100 == 0:
+                    await status_msg.edit_text(
+                        f"📦 *Chunk {chunk_num + 1}/{total_chunks}* - {i + 1}/{len(chunk_users)} users\n"
+                        f"✅ Sent: {successful}\n"
+                        f"❌ Failed: {failed}\n"
+                        f"🚫 Blocked: {blocked}",
+                        parse_mode="Markdown"
+                    )
+                
+                # Small delay to avoid hitting rate limits
+                await asyncio.sleep(0.05)
+                
+            except Exception as e:
+                error_str = str(e).lower()
+                if "blocked" in error_str or "forbidden" in error_str or "deactivated" in error_str or "bot was blocked" in error_str:
+                    chunk_blocked += 1
+                    blocked += 1
+                else:
+                    chunk_failed += 1
+                    failed += 1
+                
+                log.warning(f"Failed to send to {user_id}: {e}")
+        
+        # Store chunk result
+        chunk_results.append({
+            'chunk': chunk_num + 1,
+            'users': len(chunk_users),
+            'success': chunk_success,
+            'failed': chunk_failed,
+            'blocked': chunk_blocked
+        })
+        
+        # Update status after chunk completion
+        await status_msg.edit_text(
+            f"✅ *Chunk {chunk_num + 1}/{total_chunks} Complete*\n"
+            f"📊 *Results for this chunk:*\n"
+            f"✅ Sent: {chunk_success}\n"
+            f"❌ Failed: {chunk_failed}\n"
+            f"🚫 Blocked: {chunk_blocked}\n\n"
+            f"📈 *Overall Progress:*\n"
+            f"✅ Total Sent: {successful}\n"
+            f"❌ Total Failed: {failed}\n"
+            f"🚫 Total Blocked: {blocked}\n"
+            f"📊 Completion: {(successful + failed + blocked)/total_users*100:.1f}%",
+            parse_mode="Markdown"
+        )
+        
+        # Delay between chunks (2 seconds to avoid hitting limits)
+        if chunk_num < total_chunks - 1:
+            await asyncio.sleep(2)
+    
+    # Final summary
+    elapsed_time = time.time() - start_time
+    avg_speed = successful / elapsed_time if elapsed_time > 0 else 0
+    
+    # Create detailed summary
+    summary = f"✅ *Broadcast Complete!*\n\n"
+    summary += f"📊 *Final Statistics:*\n"
+    summary += f"👥 Total Users: {total_users}\n"
+    summary += f"✅ Successfully Sent: {successful}\n"
+    summary += f"❌ Failed: {failed}\n"
+    summary += f"🚫 Blocked/Deactivated: {blocked}\n"
+    summary += f"📦 Chunks Processed: {total_chunks}\n"
+    summary += f"⏱️ Time Taken: {elapsed_time:.1f} seconds\n"
+    summary += f"⚡ Avg Speed: {avg_speed:.1f} users/sec\n\n"
+    
+    # Add chunk details
+    summary += f"📋 *Chunk Details:*\n"
+    for chunk in chunk_results:
+        summary += f"Chunk {chunk['chunk']}: {chunk['success']}✅/{chunk['failed']}❌/{chunk['blocked']}🚫\n"
+    
+    # Calculate success rate
+    success_rate = (successful / total_users * 100) if total_users > 0 else 0
+    summary += f"\n📈 Success Rate: {success_rate:.1f}%"
+    
+    await status_msg.edit_text(summary, parse_mode="Markdown")
+    
+    # Log the broadcast
+    log.info(f"Broadcast completed: {successful}/{total_users} successful, {failed} failed, {blocked} blocked")
 
-    for user_id in user_ids[:100]:  # Limit to 100 for free tier
+async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle broadcast confirmation callbacks"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    
+    if data == "cancel_broadcast":
+        await query.edit_message_text("❌ Broadcast cancelled")
+        return
+    
+    if data.startswith("confirm_broadcast"):
         try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"📢 *Broadcast*\n\n{message_text}",
-                parse_mode="Markdown"
+            total_users = int(data.split("|")[1])
+            
+            # Get the message text from context
+            message_text = context.chat_data.get('broadcast_message', '')
+            
+            if not message_text:
+                await query.edit_message_text("❌ Could not retrieve message. Please try again.")
+                return
+            
+            await query.edit_message_text(
+                f"🔄 Starting broadcast to {total_users} users...\n"
+                f"📦 Processing in chunks of 1000 users"
             )
-            successful += 1
-            await asyncio.sleep(0.05)
+            
+            # Get all users
+            user_ids = await db.get_all_user_ids(exclude_admin=True)
+            
+            # Start the broadcast process
+            asyncio.create_task(process_broadcast_chunks(
+                context, user_ids, message_text, query.message
+            ))
+            
+            # Clear stored message
+            context.chat_data.pop('broadcast_message', None)
+            
         except Exception as e:
-            failed += 1
-            log.warning(f"Failed to send to {user_id}: {e}")
-
-    await status_msg.edit_text(
-        f"✅ Broadcast complete\n✅ Sent: {successful}\n❌ Failed: {failed}",
-        parse_mode="Markdown"
-    )
-    await schedule_message_deletion(context, status_msg.chat_id, status_msg.message_id)
+            log.error(f"Error in broadcast confirmation: {e}")
+            await query.edit_message_text(f"❌ Error starting broadcast: {str(e)[:100]}")
 
 async def clearcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Clear membership cache (admin only)"""
@@ -1467,8 +1598,10 @@ async def initialize_bot():
             first=10
         )
 
-    # Add handlers
+    # Add error handler
     application.add_error_handler(error_handler)
+    
+    # Add command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("listfiles", listfiles))
@@ -1479,9 +1612,12 @@ async def initialize_bot():
     application.add_handler(CommandHandler("testchannel", testchannel))
     application.add_handler(CommandHandler("cleanup", cleanup))
 
+    # Add callback handlers
     application.add_handler(CallbackQueryHandler(check_join, pattern="^check_membership$"))
     application.add_handler(CallbackQueryHandler(check_join, pattern="^check\\|"))
+    application.add_handler(CallbackQueryHandler(broadcast_callback, pattern="^(confirm_broadcast|cancel_broadcast)$"))
 
+    # Add upload handler (admin only)
     upload_filter = filters.VIDEO | filters.Document.ALL
     application.add_handler(
         MessageHandler(upload_filter & filters.User(ADMIN_ID) & filters.ChatType.PRIVATE, upload)
