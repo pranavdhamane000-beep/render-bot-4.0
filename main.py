@@ -1,9 +1,10 @@
 import os
 import logging
+import threading
+from flask import Flask, jsonify
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from paddleocr import PaddleOCR, LayoutDetection
-import cv2
 import numpy as np
 from PIL import Image
 import io
@@ -13,25 +14,46 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
                     level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize models
+# Create Flask app for web server
+app = Flask(__name__)
+
+# Initialize models (global so both threads can access)
 print("Loading PaddleOCR (text recognition)...")
 ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
 
 print("Loading PP-DocLayout-S (layout detection)...")
-layout_model = LayoutDetection(model_name="PP-DocLayout-S")  # 👈 This is the key!
+layout_model = LayoutDetection(model_name="PP-DocLayout-S")
+
+# Telegram bot application (will be initialized in main)
+telegram_app = None
+
+# Flask route for health checks
+@app.route('/')
+def home():
+    return jsonify({
+        "status": "running",
+        "message": "Document Analysis Bot is running!",
+        "bot_ready": telegram_app is not None
+    })
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy"}), 200
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a welcome message when /start is issued."""
     await update.message.reply_text(
         '👋 Hi! Send me any image, and I\'ll analyze its layout and text!\n\n'
-        'I can detect document structure, text regions, tables, seals, and more.'
+        'I can detect document structure, text regions, tables, seals, and more.\n\n'
+        '**How to use:** Just send me a photo!'
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a message when /help is issued."""
     await update.message.reply_text(
         'Just send me an image (photo, screenshot, document scan)\n'
-        'I\'ll analyze the layout and tell you what elements I find!'
+        'I\'ll analyze the layout and tell you what elements I find!\n\n'
+        '**Supported:** ID cards, documents, forms, receipts, screenshots'
     )
 
 async def analyze_layout(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -86,43 +108,60 @@ async def analyze_layout(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if doc_indicators >= 2:
             response += f"\n📄 **This appears to be a DOCUMENT** (layout score: {doc_indicators})\n"
+        elif doc_indicators == 1:
+            response += f"\n📄 **Might be a document** (low confidence)\n"
         else:
             response += f"\n🖼️ **This may NOT be a formal document**\n"
         
         if text_found:
             response += f"\n📋 First few lines:\n"
             for line in text_found[:3]:
-                response += f"• {line[:50]}\n"
+                # Truncate long lines
+                short_line = line[:50] + "..." if len(line) > 50 else line
+                response += f"• {short_line}\n"
         
         await update.message.reply_text(response)
         
     except Exception as e:
         logger.error(f"Error processing image: {e}")
-        await update.message.reply_text(f"❌ Error: {str(e)[:100]}")
+        await update.message.reply_text(f"❌ Error: {str(e)[:200]}")
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Log errors."""
     logger.error(f"Update {update} caused error {context.error}")
 
-def main():
-    """Start the bot."""
+def run_bot():
+    """Run the Telegram bot in a separate thread."""
+    global telegram_app
+    
     token = os.environ.get('7666489482:AAGXxYdgfKZGehpByZo2KXyFG5hGdM808YQ')
     if not token:
         logger.error("No token found! Set TELEGRAM_BOT_TOKEN environment variable.")
         return
     
     # Create the Application
-    application = Application.builder().token(token).build()
+    telegram_app = Application.builder().token(token).build()
 
     # Register handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.PHOTO, analyze_layout))
-    
-    application.add_error_handler(error_handler)
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CommandHandler("help", help_command))
+    telegram_app.add_handler(MessageHandler(filters.PHOTO, analyze_layout))
+    telegram_app.add_error_handler(error_handler)
 
-    print("🤖 Bot is running... Send it an image on Telegram!")
-    application.run_polling()
+    logger.info("🤖 Telegram bot starting...")
+    telegram_app.run_polling()
+
+def run_flask():
+    """Run the Flask web server."""
+    port = int(os.environ.get('PORT', 10000))
+    logger.info(f"🌐 Web server starting on port {port}...")
+    app.run(host='0.0.0.0', port=port)
 
 if __name__ == '__main__':
-    main()
+    # Start Telegram bot in a background thread
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    logger.info("✅ Bot thread started")
+    
+    # Run Flask in the main thread (this blocks)
+    run_flask()
