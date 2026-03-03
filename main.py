@@ -18,7 +18,7 @@ from PIL import Image
 import numpy as np
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Replace with your actual bot token
+BOT_TOKEN = "7666489482:AAGXxYdgfKZGehpByZo2KXyFG5hGdM808YQ"  # Replace with your actual bot token
 
 # Setup logging
 logging.basicConfig(
