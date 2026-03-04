@@ -3,6 +3,34 @@ Telegram Bot using PP-DocLayout-S + PaddleOCR to detect documents
 Returns: "its doc" or "not a doc" for every image
 """
 
+import sys
+import traceback
+import logging
+
+# Force logging to print immediately
+logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
+
+try:
+    # Your existing imports go here
+    print("Starting import of telegram...", file=sys.stderr)
+    from telegram import Update
+    from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+    print("Telegram imports successful", file=sys.stderr)
+    
+    print("Importing paddleocr...", file=sys.stderr)
+    from paddleocr import PaddleOCR, PPStructure
+    print("PaddleOCR imports successful", file=sys.stderr)
+    
+    # ... rest of your imports
+    
+except Exception as e:
+    print("="*50, file=sys.stderr)
+    print("FATAL ERROR DURING STARTUP:", file=sys.stderr)
+    print(str(e), file=sys.stderr)
+    print(traceback.format_exc(), file=sys.stderr)
+    print("="*50, file=sys.stderr)
+    sys.exit(1)
+    
 import os
 import logging
 from pathlib import Path
