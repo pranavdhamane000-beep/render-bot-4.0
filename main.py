@@ -1,167 +1,168 @@
+"""
+Telegram Bot using PP-DocLayout-S to detect documents
+Returns: "its doc" or "not a doc" for every image
+"""
+
 import os
 import logging
-import threading
-from flask import Flask, jsonify
+from pathlib import Path
+from datetime import datetime
+import tempfile
+from typing import Tuple
+
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from paddleocr import PaddleOCR, LayoutDetection
-import numpy as np
-from PIL import Image
-import io
+from paddleocr import LayoutDetection
 
-# Enable logging
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                    level=logging.INFO)
+# ==================== CONFIGURATION ====================
+BOT_TOKEN = "7666489482:AAGXxYdgfKZGehpByZo2KXyFG5hGdM808YQ"  # Replace with your actual bot token
+
+# Setup logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-# Create Flask app for web server
-app = Flask(__name__)
+# ==================== INITIALIZE PP-DOCLAYOUT-S ====================
+print("🔄 Loading PP-DocLayout-S model...")
+try:
+    detector = LayoutDetection(
+        model_name="PP-DocLayout-S",
+        device='CPU'
+    )
+    print("✅ PP-DocLayout-S loaded successfully!")
+except Exception as e:
+    print(f"❌ Error loading model: {e}")
+    detector = None
 
-# Initialize models (global so both threads can access)
-print("Loading PaddleOCR (text recognition)...")
-ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+# ==================== DOCUMENT DETECTION ====================
+def is_document(image_path: str) -> Tuple[bool, str]:
+    """
+    Returns: (True/False, reason)
+    """
+    try:
+        if detector is None:
+            return False, "Model not loaded"
+        
+        # Run layout detection
+        result = detector.predict(image_path)
+        
+        # Document elements that indicate it's a document
+        doc_indicators = [
+            'text', 'paragraph_title', 'document_title', 
+            'table', 'figure', 'list', 'header', 'footer',
+            'text_block', 'paragraph', 'abstract'
+        ]
+        
+        # Count document elements found
+        doc_elements = []
+        for detection in result:
+            if detection['boxes'] and len(detection['boxes']) > 0:
+                for box in detection['boxes']:
+                    element_type = box.get('label', 'unknown')
+                    confidence = box.get('score', 0)
+                    
+                    if element_type in doc_indicators and confidence > 0.5:
+                        doc_elements.append(element_type)
+        
+        # Decision: if 2+ elements OR 1 high-confidence element
+        if len(doc_elements) >= 2:
+            return True, f"Found {len(doc_elements)} document elements"
+        elif len(doc_elements) == 1 and confidence > 0.8:
+            return True, "Found high-confidence document element"
+        else:
+            return False, "No document layout detected"
+            
+    except Exception as e:
+        logger.error(f"Detection error: {e}")
+        return False, f"Error: {str(e)}"
 
-print("Loading PP-DocLayout-S (layout detection)...")
-layout_model = LayoutDetection(model_name="PP-DocLayout-S")
-
-# Telegram bot application (will be initialized in main)
-telegram_app = None
-
-# Flask route for health checks
-@app.route('/')
-def home():
-    return jsonify({
-        "status": "running",
-        "message": "Document Analysis Bot is running!",
-        "bot_ready": telegram_app is not None
-    })
-
-@app.route('/health')
-def health():
-    return jsonify({"status": "healthy"}), 200
-
+# ==================== TELEGRAM HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a welcome message when /start is issued."""
-    await update.message.reply_text(
-        '👋 Hi! Send me any image, and I\'ll analyze its layout and text!\n\n'
-        'I can detect document structure, text regions, tables, seals, and more.\n\n'
-        '**How to use:** Just send me a photo!'
+    """Welcome message"""
+    welcome_text = (
+        "📄 *Document Detector Bot*\n\n"
+        "Send me any image and I'll tell you:\n"
+        "• ✅ *its doc* - if it's a document\n"
+        "• ❌ *not a doc* - if it's not a document\n\n"
+        "Using PP-DocLayout-S for fast detection!"
     )
+    await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a message when /help is issued."""
-    await update.message.reply_text(
-        'Just send me an image (photo, screenshot, document scan)\n'
-        'I\'ll analyze the layout and tell you what elements I find!\n\n'
-        '**Supported:** ID cards, documents, forms, receipts, screenshots'
-    )
-
-async def analyze_layout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Process the image for layout detection and OCR."""
-    await update.message.reply_text("📸 Analyzing image... please wait a moment.")
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process images"""
+    # Send typing indicator
+    await update.message.chat.send_action(action="typing")
+    
+    # Get the photo
+    photo = await update.message.photo[-1].get_file()
+    
+    # Create temp file
+    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp_file:
+        file_path = tmp_file.name
     
     try:
-        # Download the image
-        photo_file = await update.message.photo[-1].get_file()
-        image_bytes = await photo_file.download_as_bytearray()
+        # Download image
+        await photo.download_to_drive(file_path)
         
-        # Convert to image format
-        image = Image.open(io.BytesIO(image_bytes))
-        image_np = np.array(image)
+        # Send processing message
+        processing = await update.message.reply_text("🔍 Analyzing...")
         
-        # STEP 1: Run PP-DocLayout-S for layout detection
-        layout_results = layout_model.predict(image_np, batch_size=1, layout_nms=True)
+        # Detect if document
+        is_doc, reason = is_document(file_path)
         
-        # STEP 2: Run OCR for text extraction
-        ocr_results = ocr.ocr(image_np, cls=True)
-        
-        # Process layout results
-        layout_elements = []
-        doc_indicators = 0
-        doc_keywords = ['text', 'title', 'table', 'seal', 'header', 'footer', 'formula']
-        
-        for res in layout_results:
-            for box in res.boxes:
-                label = box.get('label', '')
-                confidence = box.get('score', 0)
-                layout_elements.append(f"{label} ({confidence:.2f})")
-                
-                if any(keyword in label.lower() for keyword in doc_keywords):
-                    doc_indicators += 1
-        
-        # Process OCR results
-        text_found = []
-        if ocr_results and ocr_results[0]:
-            for line in ocr_results[0]:
-                text_found.append(line[1][0])
-        
-        # Prepare response
-        response = f"✅ **Analysis Complete**\n\n"
-        response += f"📐 **Layout Elements Found:** {len(layout_elements)}\n"
-        
-        if layout_elements:
-            response += f"Top elements:\n"
-            for elem in layout_elements[:5]:
-                response += f"• {elem}\n"
-        
-        response += f"\n📝 **Text Lines Found:** {len(text_found)}\n"
-        
-        if doc_indicators >= 2:
-            response += f"\n📄 **This appears to be a DOCUMENT** (layout score: {doc_indicators})\n"
-        elif doc_indicators == 1:
-            response += f"\n📄 **Might be a document** (low confidence)\n"
+        # Send result
+        if is_doc:
+            await update.message.reply_text("✅ its doc")
         else:
-            response += f"\n🖼️ **This may NOT be a formal document**\n"
+            await update.message.reply_text("❌ not a doc")
         
-        if text_found:
-            response += f"\n📋 First few lines:\n"
-            for line in text_found[:3]:
-                # Truncate long lines
-                short_line = line[:50] + "..." if len(line) > 50 else line
-                response += f"• {short_line}\n"
+        # Delete processing message
+        await processing.delete()
         
-        await update.message.reply_text(response)
+        # Log
+        logger.info(f"Result: {'doc' if is_doc else 'not doc'} - {reason}")
         
     except Exception as e:
-        logger.error(f"Error processing image: {e}")
-        await update.message.reply_text(f"❌ Error: {str(e)[:200]}")
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Log errors."""
-    logger.error(f"Update {update} caused error {context.error}")
-
-def run_bot():
-    """Run the Telegram bot in a separate thread."""
-    global telegram_app
+        logger.error(f"Error: {e}")
+        await update.message.reply_text("❌ Error processing image")
     
-    token = os.environ.get('7666489482:AAGXxYdgfKZGehpByZo2KXyFG5hGdM808YQ')
-    if not token:
-        logger.error("No token found! Set TELEGRAM_BOT_TOKEN environment variable.")
-        return
+    finally:
+        # Clean up
+        if os.path.exists(file_path):
+            os.unlink(file_path)
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle document files"""
+    doc = update.message.document
     
-    # Create the Application
-    telegram_app = Application.builder().token(token).build()
+    if doc.mime_type and doc.mime_type.startswith('image/'):
+        await handle_image(update, context)
+    else:
+        await update.message.reply_text("❌ Please send an image file")
 
-    # Register handlers
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CommandHandler("help", help_command))
-    telegram_app.add_handler(MessageHandler(filters.PHOTO, analyze_layout))
-    telegram_app.add_error_handler(error_handler)
-
-    logger.info("🤖 Telegram bot starting...")
-    telegram_app.run_polling()
-
-def run_flask():
-    """Run the Flask web server."""
-    port = int(os.environ.get('PORT', 10000))
-    logger.info(f"🌐 Web server starting on port {port}...")
-    app.run(host='0.0.0.0', port=port)
+# ==================== MAIN ====================
+def main():
+    """Start the bot"""
+    
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_image))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    
+    # Start bot
+    print("\n" + "="*50)
+    print("🤖 Document Detector Bot Started!")
+    print("="*50)
+    print("Model: PP-DocLayout-S")
+    print("Send images to your bot to test!")
+    print("Press Ctrl+C to stop.\n")
+    
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
-    # Start Telegram bot in a background thread
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-    logger.info("✅ Bot thread started")
-    
-    # Run Flask in the main thread (this blocks)
-    run_flask()
+    main()
