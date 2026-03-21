@@ -9,7 +9,6 @@ import uuid
 import logging
 
 # ============= SIMPLIFIED PADDLEOCR IMPORT =============
-# Use the base PaddleOCR with layout detection enabled
 from paddleocr import PaddleOCR
 
 # ============= LOGGING =============
@@ -47,7 +46,7 @@ def health_check():
     })
 
 # ============= BOT HANDLERS =============
-@dp.message(Command("start"))
+# Define handlers as regular functions (no decorators)
 async def start_command(message: types.Message):
     await message.answer(
         "📄 **Document Layout Analyzer Bot**\n\n"
@@ -62,7 +61,6 @@ async def start_command(message: types.Message):
         parse_mode="Markdown"
     )
 
-@dp.message(Command("help"))
 async def help_command(message: types.Message):
     await message.answer(
         "📖 **How to use:**\n\n"
@@ -76,7 +74,6 @@ async def help_command(message: types.Message):
         parse_mode="Markdown"
     )
 
-@dp.message(Command("status"))
 async def status_command(message: types.Message):
     await message.answer(
         "🟢 **Bot Status:** Online\n\n"
@@ -86,7 +83,6 @@ async def status_command(message: types.Message):
         parse_mode="Markdown"
     )
 
-@dp.message(lambda message: message.document or message.photo)
 async def handle_document(message: types.Message):
     processing_msg = await message.answer("🔄 **Analyzing document layout...**", parse_mode="Markdown")
     
@@ -115,12 +111,11 @@ async def handle_document(message: types.Message):
         detected_elements = []
         if result and result[0]:
             for line in result[0]:
-                # Each line has [bbox, (text, confidence)]
                 bbox = line[0]
                 text = line[1][0]
                 confidence = line[1][1]
                 detected_elements.append({
-                    "text": text[:50],  # Truncate for summary
+                    "text": text[:50],
                     "confidence": confidence,
                     "bbox": bbox
                 })
@@ -151,27 +146,30 @@ async def setup_bot():
     global bot, dp, ocr_model
     
     logger.info("Loading PaddleOCR with layout detection...")
-    # Initialize with layout detection enabled
+    # Initialize OCR model
     ocr_model = PaddleOCR(
         use_angle_cls=True,
         lang='en',
         show_log=False,
-        det_db_thresh=0.3,  # Detection threshold
+        det_db_thresh=0.3,
         det_db_box_thresh=0.5,
         rec_batch_num=6
     )
     logger.info("✅ Model loaded successfully!")
     
+    # Initialize bot and dispatcher
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     
-    # Register handlers
+    # Register handlers (THIS IS THE FIXED PART)
     dp.message.register(start_command, Command("start"))
     dp.message.register(help_command, Command("help"))
     dp.message.register(status_command, Command("status"))
     dp.message.register(handle_document, lambda message: message.document or message.photo)
     
     logger.info("Bot handlers registered")
+    
+    # Start polling
     await dp.start_polling(bot)
 
 # ============= RUN FLASK IN THREAD =============
@@ -183,8 +181,11 @@ def run_bot():
     asyncio.run(setup_bot())
 
 if __name__ == "__main__":
+    # Start Flask health check server in background
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
     logger.info(f"Flask health check server started on port {os.environ.get('PORT', 10000)}")
+    
+    # Start the bot (this will run forever)
     run_bot()
