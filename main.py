@@ -1,304 +1,240 @@
 import os
-import logging
 import asyncio
-from datetime import datetime
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import threading
+from flask import Flask, jsonify
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import FSInputFile
 from paddleocr import LayoutDetection
+import uuid
+import logging
 
-# ============= CONFIGURATION =============
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Replace with your bot token
-DOCUMENT_THRESHOLD = 2  # Number of layout elements needed to classify as document
-CONFIDENCE_THRESHOLD = 0.3  # Minimum confidence for detections
-
-# Setup logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# ============= LOGGING =============
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ============= DOCUMENT CLASSIFIER =============
-class DocumentClassifier:
-    def __init__(self):
-        """Initialize PP-DocLayout-S model through PaddleOCR"""
-        logger.info("🔄 Loading PP-DocLayout-S model...")
-        try:
-            # Load the efficient document layout model
-            self.model = LayoutDetection(
-                model_name="PP-DocLayout-S",
-                # Optional: Set confidence threshold if supported
-            )
-            logger.info("✅ Model loaded successfully!")
-        except Exception as e:
-            logger.error(f"❌ Failed to load model: {e}")
-            raise
+# ============= CONFIGURATION =============
+# Get bot token from environment variable (SECURE!)
+BOT_TOKEN = os.environ.get("7666489482:AAGXxYdgfKZGehpByZo2KXyFG5hGdM808YQ")
+if not BOT_TOKEN:
+    raise ValueError("No TELEGRAM_BOT_TOKEN found in environment variables!")
 
-    def classify_image(self, image_path: str) -> dict:
-        """
-        Classify image as document or non-document
+DOWNLOAD_FOLDER = "downloads"
+OUTPUT_FOLDER = "output"
+
+# Create folders if they don't exist
+os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+# Flask app for health checks
+flask_app = Flask(__name__)
+
+# Global bot objects
+bot = None
+dp = None
+layout_model = None
+
+# ============= FLASK HEALTH CHECK ENDPOINTS =============
+@flask_app.route('/')
+@flask_app.route('/health')
+def health_check():
+    return jsonify({
+        "status": "healthy",
+        "bot": "running",
+        "model": "PP-DocLayout-S",
+        "ready": layout_model is not None
+    })
+
+# ============= BOT HANDLERS =============
+async def start_command(message: types.Message):
+    await message.answer(
+        "📄 **Document Layout Analyzer Bot**\n\n"
+        "Send me any document (PDF or image), and I'll analyze its layout structure!\n\n"
+        "**I can detect 23 elements including:**\n"
+        "• 📝 Text blocks & paragraphs\n"
+        "• 📌 Titles & headings\n"
+        "• 📊 Tables & figures\n"
+        "• 🧮 Formulas & algorithms\n"
+        "• 📄 Headers, footers & page numbers\n"
+        "• 🔖 References & footnotes\n"
+        "• 🖼️ Images with captions\n\n"
+        "Powered by **PP-DocLayout-S** (lightweight, 4.8MB model)\n"
+        "⚡ Fast CPU inference: ~10ms per page",
+        parse_mode="Markdown"
+    )
+
+async def help_command(message: types.Message):
+    await message.answer(
+        "📖 **How to use:**\n\n"
+        "1. Send me a **PDF file** or **image** (JPG, PNG)\n"
+        "2. I'll analyze the document layout\n"
+        "3. I'll send back a summary of detected elements\n"
+        "4. You'll also get a visualization image\n\n"
+        "**Commands:**\n"
+        "/start - Introduction\n"
+        "/help - This help message\n"
+        "/status - Check bot status",
+        parse_mode="Markdown"
+    )
+
+async def status_command(message: types.Message):
+    await message.answer(
+        "🟢 **Bot Status:** Online\n\n"
+        "**Model:** PP-DocLayout-S\n"
+        "**Model Size:** 4.8 MB\n"
+        "**Supported Languages:** Chinese & English\n"
+        "**Detection Categories:** 23 document elements",
+        parse_mode="Markdown"
+    )
+
+async def handle_document(message: types.Message):
+    # Send initial processing message
+    processing_msg = await message.answer("🔄 **Analyzing document layout...**", parse_mode="Markdown")
+    
+    try:
+        # Generate unique filename to avoid conflicts
+        unique_id = uuid.uuid4().hex[:8]
         
-        Returns:
-            dict: {
-                'is_document': bool,
-                'detection_count': int,
-                'labels': list,
-                'confidence_scores': list,
-                'detections': list
-            }
-        """
-        try:
-            # Run layout detection
-            results = self.model.predict(
-                image_path,
-                batch_size=1,
-                layout_nms=True  # Non-Maximum Suppression for cleaner results
-            )
-            
-            # Parse detections
-            detections = []
-            for result in results:
-                if hasattr(result, 'boxes') and result.boxes:
-                    for box in result.boxes:
-                        detections.append({
-                            'label': box.get('label', 'unknown'),
-                            'score': box.get('score', 0),
-                            'bbox': box.get('coordinate', [])
-                        })
-            
-            # Filter by confidence threshold
-            filtered_detections = [d for d in detections if d['score'] >= CONFIDENCE_THRESHOLD]
-            
-            # Extract labels and scores
-            labels = [d['label'] for d in filtered_detections]
-            scores = [d['score'] for d in filtered_detections]
-            
-            # Classify as document if enough layout elements detected
-            is_document = len(filtered_detections) >= DOCUMENT_THRESHOLD
-            
-            return {
-                'is_document': is_document,
-                'detection_count': len(filtered_detections),
-                'total_detections': len(detections),
-                'labels': labels,
-                'confidence_scores': scores,
-                'detections': filtered_detections
-            }
-            
-        except Exception as e:
-            logger.error(f"Error classifying image: {e}")
-            return {
-                'is_document': False,
-                'detection_count': 0,
-                'total_detections': 0,
-                'labels': [],
-                'confidence_scores': [],
-                'detections': [],
-                'error': str(e)
-            }
-
-# ============= TELEGRAM BOT HANDLERS =============
-class TelegramBot:
-    def __init__(self, token: str):
-        self.token = token
-        self.classifier = DocumentClassifier()
-        self.temp_dir = "temp_images"
+        # Download the file
+        if message.document:
+            file = await bot.get_file(message.document.file_id)
+            file_extension = message.document.file_name.split('.')[-1] if '.' in message.document.file_name else 'pdf'
+            file_path = os.path.join(DOWNLOAD_FOLDER, f"{unique_id}.{file_extension}")
+            await bot.download_file(file.file_path, file_path)
+            file_name = message.document.file_name
+        else:  # Photo
+            file = await bot.get_file(message.photo[-1].file_id)
+            file_path = os.path.join(DOWNLOAD_FOLDER, f"{unique_id}.jpg")
+            await bot.download_file(file.file_path, file_path)
+            file_name = "image.jpg"
         
-        # Create temp directory if it doesn't exist
-        if not os.path.exists(self.temp_dir):
-            os.makedirs(self.temp_dir)
-
-    def get_temp_path(self) -> str:
-        """Generate unique temp file path"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        return os.path.join(self.temp_dir, f"image_{timestamp}.jpg")
-
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
-        welcome_message = (
-            "👋 **Welcome to Document Detection Bot!**\n\n"
-            "I use **PP-DocLayout-S** (PaddleOCR) to detect document layouts.\n\n"
-            "📄 **What I can detect:**\n"
-            "• Document titles and headings\n"
-            "• Text paragraphs\n"
-            "• Tables and figures\n"
-            "• Formulas and algorithms\n"
-            "• Headers and footers\n"
-            "• Page numbers\n"
-            "• References and footnotes\n"
-            "• And 15+ more layout elements!\n\n"
-            "🔍 **How to use:**\n"
-            "Simply send me any image (photo or file), and I'll tell you if it's a document!\n\n"
-            f"⚙️ *Detection threshold:* {DOCUMENT_THRESHOLD}+ layout elements\n"
-            f"🎯 *Confidence threshold:* {CONFIDENCE_THRESHOLD * 100}%\n\n"
-            "📊 **Commands:**\n"
-            "/start - Show this message\n"
-            "/help - Detailed help\n"
-            "/stats - Show model information"
-        )
-        await update.message.reply_text(welcome_message, parse_mode='Markdown')
-
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /help command"""
-        help_text = (
-            "📖 **How Document Detection Works**\n\n"
-            "1️⃣ **Send any image** - I'll analyze it using PP-DocLayout-S\n"
-            "2️⃣ **Layout detection** - I identify document elements like text, tables, etc.\n"
-            "3️⃣ **Classification** - If I find 2+ layout elements, it's a document!\n\n"
-            "**What makes something a document?**\n"
-            "✓ Contains structured text blocks\n"
-            "✓ Has titles, paragraphs, or tables\n"
-            "✓ Includes typical document elements like headers/footers\n"
-            "✓ Shows academic or business document structure\n\n"
-            "**Supported image formats:**\n"
-            "JPG, PNG, JPEG, and most common image formats\n\n"
-            "**Examples of documents:**\n"
-            "• Scanned papers and forms\n"
-            "• Screenshots of articles\n"
-            "• PDF pages converted to images\n"
-            "• Academic papers and reports\n\n"
-            "**Examples of non-documents:**\n"
-            "• Photos of people/places\n"
-            "• Nature photography\n"
-            "• Abstract artwork\n"
-            "• Memes and casual photos"
-        )
-        await update.message.reply_text(help_text, parse_mode='Markdown')
-
-    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /stats command"""
-        stats_text = (
-            "📊 **Model Statistics**\n\n"
-            "🤖 **Model:** PP-DocLayout-S\n"
-            "🏢 **Framework:** PaddleOCR / PaddlePaddle\n"
-            "📦 **Model Size:** 4.8 MB\n"
-            "⚡ **CPU Speed:** ~10ms per image\n"
-            "🎯 **mAP Accuracy:** 70.9% on document datasets\n"
-            "📚 **Detection Classes:** 23 types\n\n"
-            "**Detectable elements:**\n"
-            "• document title | paragraph title | text\n"
-            "• page number | abstract | table of contents\n"
-            "• references | footnotes | header | footer\n"
-            "• algorithm | formula | image | figure\n"
-            "• table | caption | seal\n"
-            "• aside text | formula number | etc.\n\n"
-            f"⚙️ **Current Settings:**\n"
-            f"• Document threshold: {DOCUMENT_THRESHOLD} detections\n"
-            f"• Confidence threshold: {CONFIDENCE_THRESHOLD * 100}%\n"
-            f"• Non-Maximum Suppression: Enabled"
-        )
-        await update.message.reply_text(stats_text, parse_mode='Markdown')
-
-    async def handle_image(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle incoming images"""
-        try:
-            # Send typing indicator
-            await update.message.chat.send_action(action="typing")
-            
-            # Get the image file
-            if update.message.photo:
-                photo_file = await update.message.photo[-1].get_file()
-            elif update.message.document:
-                photo_file = await update.message.document.get_file()
-            else:
-                await update.message.reply_text("Please send an image file.")
-                return
-            
-            # Notify user we're processing
-            processing_msg = await update.message.reply_text("🔍 **Analyzing image layout...**", parse_mode='Markdown')
-            
-            # Download image to temp file
-            temp_path = self.get_temp_path()
-            await photo_file.download_to_drive(temp_path)
-            
-            # Classify the image
-            result = self.classifier.classify_image(temp_path)
-            
-            # Delete temp file
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-            
-            # Delete processing message
-            await processing_msg.delete()
-            
-            # Prepare response based on classification
-            if result.get('error'):
-                error_msg = f"⚠️ **Error:** {result['error']}\n\nPlease try again with a different image."
-                await update.message.reply_text(error_msg, parse_mode='Markdown')
-                return
-            
-            if result['is_document']:
-                # Format document response with details
-                unique_labels = list(set(result['labels']))
-                labels_text = "\n".join([f"• {label}" for label in unique_labels[:8]])
+        logger.info(f"Processing file: {file_name}")
+        
+        # Run layout detection
+        output = layout_model.predict(file_path, batch_size=1, layout_nms=True)
+        
+        # Parse and count detected elements
+        detected_elements = []
+        element_counts = {}
+        
+        for res in output:
+            for box in res.get("boxes", []):
+                label = box["label"]
+                score = box["score"]
+                bbox = box["coordinate"]
                 
-                response = (
-                    f"📄 **✓ DOCUMENT DETECTED**\n\n"
-                    f"Found **{result['detection_count']}** layout elements\n"
-                    f"_(Confidence threshold: {CONFIDENCE_THRESHOLD * 100}%)_\n\n"
-                    f"**Detected elements:**\n{labels_text}"
-                )
+                detected_elements.append({
+                    "label": label,
+                    "score": score,
+                    "bbox": bbox
+                })
                 
-                if len(unique_labels) > 8:
-                    response += f"\n\n*...and {len(unique_labels) - 8} more types*"
+                # Count elements
+                element_counts[label] = element_counts.get(label, 0) + 1
+        
+        # Build response message
+        response = f"📊 **Layout Analysis Complete**\n"
+        response += f"📄 File: `{file_name}`\n\n"
+        response += f"**Detected Elements:**\n"
+        
+        # Element name mapping for better readability
+        element_names = {
+            "text": "📝 Text blocks",
+            "paragraph_title": "📌 Paragraph titles",
+            "document_title": "📑 Document title",
+            "title": "📌 Title",
+            "table": "📊 Tables",
+            "table_caption": "📋 Table captions",
+            "figure": "🖼️ Figures",
+            "figure_caption": "🏷️ Figure captions",
+            "image": "🖼️ Images",
+            "formula": "🧮 Formulas",
+            "formula_number": "🔢 Formula numbers",
+            "algorithm": "⚙️ Algorithms",
+            "page_number": "🔢 Page numbers",
+            "header": "📄 Headers",
+            "footer": "📄 Footers",
+            "abstract": "📋 Abstracts",
+            "references": "📚 References",
+            "footnote": "📎 Footnotes",
+            "seal": "🔒 Seals"
+        }
+        
+        for label, count in sorted(element_counts.items(), key=lambda x: x[1], reverse=True):
+            display_name = element_names.get(label, label)
+            response += f"• {display_name}: **{count}**\n"
+        
+        response += f"\n⚡ Total detected regions: **{len(detected_elements)}**"
+        
+        # Delete processing message
+        await processing_msg.delete()
+        
+        # Send text summary
+        await message.answer(response, parse_mode="Markdown")
+        
+        # Save and send visualization if available
+        for idx, res in enumerate(output):
+            if hasattr(res, 'save_to_img'):
+                vis_path = os.path.join(OUTPUT_FOLDER, f"layout_{unique_id}_page_{idx}.jpg")
+                res.save_to_img(save_path=vis_path)
                 
-                # Add confidence info
-                avg_confidence = sum(result['confidence_scores']) / len(result['confidence_scores']) if result['confidence_scores'] else 0
-                response += f"\n\n📊 *Avg confidence:* {avg_confidence:.1%}"
-                
-            else:
-                # Format non-document response
-                if result['detection_count'] == 0:
-                    response = (
-                        f"❌ **NOT A DOCUMENT**\n\n"
-                        f"No document layout elements detected.\n\n"
-                        f"This appears to be a non-document image (photo, artwork, etc.)."
-                    )
-                else:
-                    response = (
-                        f"❌ **NOT A DOCUMENT**\n\n"
-                        f"Found only {result['detection_count']} layout element(s)\n"
-                        f"_(Need {DOCUMENT_THRESHOLD}+ to classify as document)_\n\n"
-                        f"Detected: {', '.join(set(result['labels']))}"
-                    )
-            
-            await update.message.reply_text(response, parse_mode='Markdown')
-            
-        except Exception as e:
-            logger.error(f"Error processing image: {e}")
-            await update.message.reply_text(
-                "⚠️ Sorry, I couldn't process that image. Please try again with a different image."
-            )
-
-    async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle document files"""
-        if update.message.document.mime_type and update.message.document.mime_type.startswith('image/'):
-            await self.handle_image(update, context)
-        else:
-            await update.message.reply_text(
-                "Please send an image file (JPG, PNG, etc.). I can only analyze images."
-            )
-
-    def run(self):
-        """Start the bot"""
-        # Create application
-        app = Application.builder().token(self.token).build()
+                if os.path.exists(vis_path):
+                    # Send visualization image
+                    photo = FSInputFile(vis_path)
+                    caption = f"📸 Layout visualization - Page {idx + 1}" if len(output) > 1 else "📸 Layout visualization"
+                    await message.answer_photo(photo, caption=caption)
+                    
+                    # Clean up visualization file
+                    os.remove(vis_path)
         
-        # Add command handlers
-        app.add_handler(CommandHandler("start", self.start_command))
-        app.add_handler(CommandHandler("help", self.help_command))
-        app.add_handler(CommandHandler("stats", self.stats_command))
+        # Clean up original file
+        os.remove(file_path)
         
-        # Add message handlers
-        app.add_handler(MessageHandler(filters.PHOTO, self.handle_image))
-        app.add_handler(MessageHandler(filters.Document.IMAGE, self.handle_document))
+        logger.info(f"Successfully processed: {file_name}")
         
-        # Start bot
-        logger.info("🚀 Starting Telegram bot...")
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception as e:
+        logger.error(f"Error processing document: {str(e)}")
+        await processing_msg.delete()
+        await message.answer(f"❌ **Error processing document:**\n`{str(e)}`", parse_mode="Markdown")
 
-# ============= MAIN =============
-if __name__ == '__main__':
-    # Replace with your bot token
-    bot = TelegramBot(BOT_TOKEN)
-    bot.run()
+# ============= SETUP BOT =============
+async def setup_bot():
+    global bot, dp, layout_model
+    
+    logger.info("Loading PP-DocLayout-S model...")
+    layout_model = LayoutDetection(model_name="PP-DocLayout-S")
+    logger.info("✅ Model loaded successfully!")
+    
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher()
+    
+    # Register handlers
+    dp.message.register(start_command, Command("start"))
+    dp.message.register(help_command, Command("help"))
+    dp.message.register(status_command, Command("status"))
+    dp.message.register(handle_document, lambda message: message.document or message.photo)
+    
+    logger.info("Bot handlers registered")
+    
+    # Start polling
+    await dp.start_polling(bot)
+
+# ============= MAIN FUNCTION =============
+def run_flask():
+    """Run Flask app for health checks"""
+    port = int(os.environ.get("PORT", 5000))
+    flask_app.run(host='0.0.0.0', port=port, debug=False)
+
+def run_bot():
+    """Run the bot in asyncio event loop"""
+    asyncio.run(setup_bot())
+
+if __name__ == "__main__":
+    # Run Flask in a separate thread for health checks
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    logger.info("Flask health check server started")
+    
+    # Run the bot (this blocks)
+    run_bot()
