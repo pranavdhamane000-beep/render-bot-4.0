@@ -23,7 +23,7 @@ app = Flask(__name__)
 
 # Global variables for web dashboard
 start_time = time.time()
-bot_username = "xiomovies_bot"
+bot_username = "xaiomovie_bot"
 # Global variable to store bot application instance for webhook
 bot_app = None
 bot_loop = None
