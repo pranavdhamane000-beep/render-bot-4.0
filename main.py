@@ -29,6 +29,10 @@ bot_username = "xoticcroissant_bot"
 bot_app = None
 bot_loop = None
 bot_initialized = False
+BOT_INIT_WAIT_SECONDS = 25
+WEBHOOK_PROCESS_TIMEOUT_SECONDS = float(os.environ.get("WEBHOOK_PROCESS_TIMEOUT_SECONDS", "1"))
+BOT_READY_POLL_INTERVAL_SECONDS = 0.1
+KEEPALIVE_INTERVAL_SECONDS = int(os.environ.get("KEEPALIVE_INTERVAL_SECONDS", "240"))
 
 # ===========================================================
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -126,7 +130,7 @@ class Database:
 
             try:
                 # Create a connection pool
-                self.pool = psycopg2.pool.SimpleConnectionPool(
+                self.pool = psycopg2.pool.ThreadedConnectionPool(
                     1, 20, dsn=dsn, connect_timeout=30,
                     sslmode='require'
                 )
@@ -153,6 +157,34 @@ class Database:
         if self.pool is None:
             await asyncio.to_thread(self._get_pool_sync)
         return self.pool
+
+    def _get_valid_connection_sync(self):
+        """Get a live connection, replacing stale idle connections if needed."""
+        pool = self._get_pool_sync()
+        last_error = None
+
+        for attempt in range(3):
+            conn = pool.getconn()
+            try:
+                if conn.closed:
+                    raise psycopg2.InterfaceError("Connection is already closed")
+
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                conn.rollback()
+                return conn
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                last_error = e
+                log.warning(f"Discarding stale PostgreSQL connection from pool (attempt {attempt + 1}/3): {e}")
+                try:
+                    pool.putconn(conn, close=True)
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        raise last_error or psycopg2.OperationalError("Unable to get a live PostgreSQL connection")
 
     def _init_db(self, conn, cur):
         """Initialize database tables (synchronous)"""
@@ -249,12 +281,12 @@ class Database:
     @asynccontextmanager
     async def get_db_connection(self):
         """Asynchronous context manager to get and return a connection from the pool."""
-        pool = await self._get_pool_async()
-        conn = await asyncio.to_thread(pool.getconn)
+        await self._get_pool_async()
+        conn = await asyncio.to_thread(self._get_valid_connection_sync)
         try:
             yield conn
         finally:
-            await asyncio.to_thread(pool.putconn, conn)
+            await asyncio.to_thread(self.pool.putconn, conn)
 
     async def execute(self, query: str, params: tuple = None):
         """Execute a query and return cursor"""
@@ -619,6 +651,12 @@ class Database:
         )
         log.info(f"Removed scheduled deletion for message {message_id}")
 
+    async def purge_overdue_scheduled_deletions(self) -> int:
+        """Drop stale deletion jobs left over from previous deployments."""
+        return await self.execute_and_commit(
+            'DELETE FROM scheduled_deletions WHERE scheduled_time <= CURRENT_TIMESTAMP'
+        )
+
     async def update_user_interaction(self, user_id: int, username: str = None,
                                     first_name: str = None, last_name: str = None,
                                     file_accessed: bool = False):
@@ -771,6 +809,23 @@ async def delete_message_job(context):
     except Exception as e:
         log.error(f"Error in delete_message_job: {e}", exc_info=True)
 
+async def delete_message_after_delay(bot, chat_id: int, message_id: int):
+    """Fallback deletion task for deployments without python-telegram-bot JobQueue."""
+    await asyncio.sleep(DELETE_AFTER)
+
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        log.info(f"Fallback deleted message {message_id}")
+        await db.remove_scheduled_message(chat_id, message_id)
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "message to delete not found" in error_msg:
+            await db.remove_scheduled_message(chat_id, message_id)
+        elif "message can't be deleted" in error_msg:
+            log.warning(f"Fallback can't delete message {message_id}")
+        else:
+            log.error(f"Fallback failed to delete message {message_id}: {e}")
+
 async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
     """Schedule a message for deletion"""
     try:
@@ -785,6 +840,9 @@ async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id:
                 name=f"delete_msg_{chat_id}_{message_id}_{int(time.time())}"
             )
             log.info(f"Scheduled deletion of message {message_id} in {DELETE_AFTER} seconds")
+        else:
+            asyncio.create_task(delete_message_after_delay(context.bot, chat_id, message_id))
+            log.info(f"Scheduled fallback deletion of message {message_id} in {DELETE_AFTER} seconds")
     except Exception as e:
         log.error(f"Failed to schedule deletion: {e}")
 
@@ -811,6 +869,27 @@ async def cleanup_overdue_messages(context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         log.error(f"Error in cleanup_overdue_messages: {e}")
+
+async def cleanup_overdue_messages_loop(bot):
+    """Fallback cleanup loop for deployments without python-telegram-bot JobQueue."""
+    while True:
+        try:
+            due_messages = await db.get_due_messages()
+            for chat_id, message_id in due_messages:
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=message_id)
+                    log.info(f"Fallback cleanup deleted overdue message {message_id}")
+                    await db.remove_scheduled_message(chat_id, message_id)
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    if "message to delete not found" in error_msg:
+                        await db.remove_scheduled_message(chat_id, message_id)
+                    else:
+                        log.error(f"Fallback cleanup failed for {message_id}: {e}")
+        except Exception as e:
+            log.error(f"Error in fallback cleanup loop: {e}")
+
+        await asyncio.sleep(300)
 
 # ============ DYNAMIC MEMBERSHIP CHECK ============
 async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bool = False) -> bool:
@@ -1079,14 +1158,23 @@ def ping():
 def webhook():
     """Handle Telegram webhook updates"""
     global bot_app, bot_loop, bot_initialized
-    
-    if not bot_initialized or bot_app is None or bot_loop is None:
-        log.error("Bot application not fully initialized for webhook")
-        return "Bot not ready", 503
 
-    update_data = request.get_json()
+    update_data = request.get_json(silent=True)
     if not update_data:
-        return "Invalid request", 400
+        log.warning("Webhook received an empty or invalid request")
+        return "OK", 200
+
+    if not bot_initialized or bot_app is None or bot_loop is None:
+        log.warning("Webhook received before bot was ready; waiting for initialization")
+        deadline = time.monotonic() + BOT_INIT_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            if bot_initialized and bot_app is not None and bot_loop is not None:
+                break
+            time.sleep(BOT_READY_POLL_INTERVAL_SECONDS)
+
+    if not bot_initialized or bot_app is None or bot_loop is None:
+        log.error("Bot application still not initialized after waiting; acknowledging update")
+        return "OK", 200
 
     # Process update in bot's event loop
     future = asyncio.run_coroutine_threadsafe(
@@ -1096,7 +1184,7 @@ def webhook():
     
     try:
         # Wait a bit for the update to be queued
-        future.result(timeout=1)
+        future.result(timeout=WEBHOOK_PROCESS_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         # Update is queued but not completed - that's fine
         pass
@@ -1342,8 +1430,7 @@ async def send_backup_to_admin(context: ContextTypes.DEFAULT_TYPE, backup_data: 
         
         await context.bot.send_message(
             chat_id=ADMIN_ID,
-            text=summary,
-            parse_mode="Markdown"
+            text=summary
         )
         
         # Send each file as a document (both CSV and JSON)
@@ -1397,8 +1484,7 @@ async def send_backup_to_admin(context: ContextTypes.DEFAULT_TYPE, backup_data: 
         
         await context.bot.send_message(
             chat_id=ADMIN_ID,
-            text=instructions,
-            parse_mode="Markdown"
+            text=instructions
         )
         
         log.info(f"✅ Database backup sent to admin (ID: {ADMIN_ID})")
@@ -1910,7 +1996,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sent = await context.bot.send_video(
                     chat_id=chat_id,
                     video=file_info["file_id"],
-                    caption=f"🎬 *{filename}*\n📥 Accessed {file_info['access_count']} times{warning}",
+                    caption=f"🎬 {markdown_code(filename)}\n📥 Accessed {file_info['access_count']} times{warning}",
                     parse_mode="Markdown",
                     supports_streaming=True
                 )
@@ -1919,7 +2005,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sent = await context.bot.send_document(
                     chat_id=chat_id,
                     document=file_info["file_id"],
-                    caption=f"📁 *{filename}*\n📥 Accessed {file_info['access_count']} times{warning}",
+                    caption=f"📁 {markdown_code(filename)}\n📥 Accessed {file_info['access_count']} times{warning}",
                     parse_mode="Markdown"
                 )
 
@@ -2076,7 +2162,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     sent = await context.bot.send_video(
                         chat_id=chat_id,
                         video=file_info["file_id"],
-                        caption=f"🎬 *{filename}*\n📥 Accessed {file_info['access_count']} times{warning}",
+                        caption=f"🎬 {markdown_code(filename)}\n📥 Accessed {file_info['access_count']} times{warning}",
                         parse_mode="Markdown",
                         supports_streaming=True
                     )
@@ -2085,7 +2171,7 @@ async def check_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     sent = await context.bot.send_document(
                         chat_id=chat_id,
                         document=file_info["file_id"],
-                        caption=f"📁 *{filename}*\n📥 Accessed {file_info['access_count']} times{warning}",
+                        caption=f"📁 {markdown_code(filename)}\n📥 Accessed {file_info['access_count']} times{warning}",
                         parse_mode="Markdown"
                     )
 
@@ -3260,6 +3346,60 @@ async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
+async def keepalive_check(bot):
+    """Keep Telegram and PostgreSQL connections warm while Render is kept awake."""
+    try:
+        await asyncio.gather(
+            bot.get_me(),
+            db.get_file_count()
+        )
+        log.debug("Keepalive check completed")
+    except Exception as e:
+        log.warning(f"Keepalive check failed: {e}")
+
+async def keepalive_job(context: ContextTypes.DEFAULT_TYPE):
+    """JobQueue keepalive wrapper."""
+    await keepalive_check(context.bot)
+
+class BotOnlyContext:
+    """Small context shim for fallback background tasks that only need context.bot."""
+    def __init__(self, bot):
+        self.bot = bot
+
+async def keepalive_loop(bot):
+    """Fallback keepalive loop for deployments without python-telegram-bot JobQueue."""
+    await asyncio.sleep(60)
+
+    while True:
+        await keepalive_check(bot)
+        await asyncio.sleep(KEEPALIVE_INTERVAL_SECONDS)
+
+async def auto_backup_loop(bot):
+    """Fallback auto-backup loop for deployments without python-telegram-bot JobQueue."""
+    await asyncio.sleep(3600)
+
+    while True:
+        log.info("Running fallback scheduled auto-backup (every 3 days)...")
+
+        try:
+            backup_data = await export_database_backup(
+                update=None,
+                context=BotOnlyContext(bot),
+                send_to_admin=True
+            )
+            log.info(f"Fallback auto-backup completed. Size: {sum(len(v) for v in backup_data.values()) / 1024:.2f} KB")
+        except Exception as e:
+            log.error(f"Fallback auto-backup failed: {e}")
+            try:
+                await bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"Auto-backup failed: {str(e)[:200]}\n\nPlease run manual backup with /backup"
+                )
+            except Exception:
+                pass
+
+        await asyncio.sleep(259200)
+
 # ============ MAIN ============
 async def initialize_bot():
     """Initialize bot application"""
@@ -3275,6 +3415,9 @@ async def initialize_bot():
         # This will run the synchronous pool initialization
         db._get_pool_sync()
         log.info("Database pool initialized.")
+        purged_deletions = await db.purge_overdue_scheduled_deletions()
+        if purged_deletions:
+            log.info(f"Purged {purged_deletions} overdue scheduled deletions from startup backlog")
     except Exception as e:
         log.error(f"Failed to initialize database: {e}", exc_info=True)
         return None
@@ -3296,6 +3439,13 @@ async def initialize_bot():
             interval=300,
             first=10
         )
+
+        application.job_queue.run_repeating(
+            keepalive_job,
+            interval=KEEPALIVE_INTERVAL_SECONDS,
+            first=60
+        )
+        log.info(f"Keepalive scheduled (every {KEEPALIVE_INTERVAL_SECONDS} seconds)")
         
         # Add auto-backup job (every 3 days = 259200 seconds)
         application.job_queue.run_repeating(
@@ -3304,6 +3454,12 @@ async def initialize_bot():
             first=3600  # Start after 1 hour
         )
         log.info("📅 Auto-backup scheduled (every 3 days)")
+
+    else:
+        asyncio.create_task(cleanup_overdue_messages_loop(application.bot))
+        asyncio.create_task(keepalive_loop(application.bot))
+        asyncio.create_task(auto_backup_loop(application.bot))
+        log.warning("JobQueue unavailable; using fallback asyncio cleanup and auto-backup loops")
 
     # Add error handler
     application.add_error_handler(error_handler)
@@ -3359,18 +3515,21 @@ async def initialize_bot():
     log.info(f"Setting webhook to: {webhook_url}")
 
     try:
-        # Delete any existing webhook
-        await application.bot.delete_webhook(drop_pending_updates=True)
+        # Preserve any updates Telegram queued while Render was restarting.
+        await application.bot.delete_webhook(drop_pending_updates=False)
         # Set new webhook
         await application.bot.set_webhook(
             url=webhook_url,
             allowed_updates=Update.ALL_TYPES,
-            max_connections=40
+            max_connections=40,
+            drop_pending_updates=False
         )
         log.info("✅ Webhook set successfully")
     except Exception as e:
         log.error(f"Failed to set webhook: {e}", exc_info=True)
         return None
+
+    await application.start()
 
     # Mark as initialized
     bot_initialized = True
@@ -3437,6 +3596,7 @@ def main():
     finally:
         log.info("Shutting down...")
         if bot_app:
+            asyncio.run(bot_app.stop())
             asyncio.run(bot_app.shutdown())
         asyncio.run(db.close_pool())
         print("Shutdown complete.")
