@@ -1528,6 +1528,13 @@ async def chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                         await send_shared_content(context, user_id, shared_content)
                         log.info(f"✅ Auto-sent file {file_key} to user {user_id}")
                         
+                        if context and hasattr(context, 'user_data') and 'force_sub_msg_id' in context.user_data:
+                            try:
+                                await context.bot.delete_message(chat_id=user_id, message_id=context.user_data['force_sub_msg_id'])
+                                del context.user_data['force_sub_msg_id']
+                            except Exception as e:
+                                log.error(f"Failed to delete force sub message: {e}")
+                        
                         # Update user interaction
                         await db.update_user_interaction(
                             user_id=user_id,
@@ -1624,6 +1631,13 @@ async def chat_join_request_handler(update: Update, context: ContextTypes.DEFAUL
                         # Send the file
                         await send_shared_content(context, user_id, shared_content)
                         log.info(f"✅ Auto-sent file {f_key} to user {user_id}")
+                        
+                        if context and hasattr(context, 'user_data') and 'force_sub_msg_id' in context.user_data:
+                            try:
+                                await context.bot.delete_message(chat_id=user_id, message_id=context.user_data['force_sub_msg_id'])
+                                del context.user_data['force_sub_msg_id']
+                            except Exception as e:
+                                log.error(f"Failed to delete force sub message: {e}")
                         
                         # Update user interaction
                         await db.update_user_interaction(
@@ -2649,17 +2663,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Create appropriate message
             safe_missing_names = [escape_markdown(name) for name in missing_names]
             if len(safe_missing_names) == 1:
-                text = f"🔒 *Please join {safe_missing_names[0]} to access this file*\n\n"
+                text = f"🔒 Join {safe_missing_names[0]} to access this file"
             elif len(safe_missing_names) == 2:
-                text = f"🔒 *Please join {safe_missing_names[0]} and {safe_missing_names[1]} to access this file*\n\n"
+                text = f"🔒 Join {safe_missing_names[0]} and {safe_missing_names[1]} to access this file"
             else:
                 channels_text = ", ".join(safe_missing_names[:-1]) + f" and {safe_missing_names[-1]}"
-                text = f"🔒 *Please join {channels_text} to access this file*\n\n"
-            
-            text += "📌 *How to proceed:*\n"
-            text += "1. Click the buttons below to join/request each channel\n"
-            text += "2. After joining all channels, **the file will be sent automatically**\n"
-            text += "3. No need to click the link again! 🎯"
+                text = f"🔒 Join {channels_text} to access this file"
 
             if verification_errors:
                 unresolved = ", ".join(markdown_code(item["name"]) for item in verification_errors)
@@ -2672,6 +2681,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
+            
+            if context and hasattr(context, 'user_data'):
+                context.user_data['force_sub_msg_id'] = sent_msg.message_id
+                
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
             return
 
@@ -2831,8 +2844,7 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     # Create invite link
                     invite_link = await context.bot.create_chat_invite_link(
                         chat_id=channel_ref,
-                        member_limit=None,
-                        expire_date=None
+                        creates_join_request=True
                     )
                     
                     # Save to database
@@ -3251,10 +3263,14 @@ async def listchannels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg += f"📢 *Active Channels ({len(active_channels)}):*\n"
     
     for i, ch in enumerate(active_channels):
-        added_date = ch['added_at'].strftime('%Y-%m-%d') if ch['added_at'] else 'Unknown'
+        added_at = ch['added_at']
+        if added_at:
+            added_date = added_at.strftime('%Y-%m-%d') if hasattr(added_at, 'strftime') else str(added_at)[:10]
+        else:
+            added_date = 'Unknown'
         channel_type = ch.get('channel_type', 'public')
         type_emoji = "🔒" if channel_type == 'private' else "📢"
-        display_name = ch['channel_name'] or ch['channel_username']
+        display_name = escape_markdown(str(ch['channel_name'] or ch['channel_username']))
         msg += f"{i+1}. {type_emoji} {display_name}\n"
         msg += f"   └ Username: @{ch['channel_username']}\n"
         msg += f"   └ Type: {channel_type}\n"
@@ -3265,7 +3281,7 @@ async def listchannels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if inactive_channels:
         msg += f"\n⏸️ *Inactive Channels ({len(inactive_channels)}):*\n"
         for i, ch in enumerate(inactive_channels):
-            display_name = ch['channel_name'] or ch['channel_username']
+            display_name = escape_markdown(str(ch['channel_name'] or ch['channel_username']))
             msg += f"{i+1}. {display_name} (@{ch['channel_username']})\n"
     
     msg += f"\n💡 *Commands:*\n"
