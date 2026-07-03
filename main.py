@@ -1408,6 +1408,14 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
         
         is_member, verification_error = await check_user_in_channel(bot, channel, user_id, force_check)
         
+        # ADD THIS: Check for private channel request
+        if not is_member and channel_type == 'private':
+            has_request = await db.has_private_request(user_id, channel_id)
+            if has_request:
+                log.info(f"User {user_id} has requested to join private {channel_name}. Treating as member for file access.")
+                is_member = True
+                verification_error = None
+        
         result["channel_status"][channel] = {
             'is_member': is_member,
             'name': channel_name,
@@ -1540,6 +1548,100 @@ async def chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         
     except Exception as e:
         log.error(f"Error in chat_member_handler: {e}", exc_info=True)
+
+
+# ============ CHAT JOIN REQUEST HANDLER ============
+async def chat_join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle chat join requests - auto send files when user requests to join private channels"""
+    try:
+        request = update.chat_join_request
+        if not request:
+            return
+            
+        user = request.from_user
+        user_id = user.id
+        chat = request.chat
+        
+        # Check if this is a channel or group
+        if chat.type not in ['channel', 'group', 'supergroup']:
+            return
+            
+        chat_id = str(chat.id)
+        if chat.type == 'channel':
+            chat_username = chat.username or chat_id
+        else:
+            chat_username = chat_id
+            
+        log.info(f"🔔 User {user_id} requested to join channel: {chat_username}")
+            
+        # Check if this is a required channel
+        channels = await db.get_channels_with_details()
+        required_channel = None
+        db_channel_id = None
+        for ch in channels:
+            if ch['is_active'] == 1:
+                normalized_ch = normalize_channel_username(ch['channel_username'])
+                normalized_joined = normalize_channel_username(chat_username)
+                if normalized_ch == normalized_joined or str(chat.id) == normalized_ch:
+                    required_channel = ch
+                    db_channel_id = ch['id']
+                    break
+                    
+        if not required_channel or not db_channel_id:
+            return
+            
+        # Register the private request in the database
+        pending_deliveries = await db.get_pending_deliveries(user_id)
+        file_key = ""
+        if pending_deliveries:
+            file_key = pending_deliveries[0]['file_key']
+            
+        await db.add_private_request(user_id, db_channel_id, file_key)
+        
+        # Check if this user has any pending deliveries
+        if not pending_deliveries:
+            return
+            
+        # For each pending delivery, check if all channels are now satisfied
+        for delivery in pending_deliveries:
+            f_key = delivery['file_key']
+            missing_channels = delivery['missing_channels']
+            
+            # Check if this channel was in the missing list
+            if chat_username not in missing_channels and str(chat.id) not in missing_channels:
+                continue
+            
+            # Check membership again fresh
+            membership_result = await check_membership(user_id, context, force_check=True)
+            
+            if membership_result['all_joined']:
+                log.info(f"🎯 User {user_id} now has ALL channels (via request)! Sending file: {f_key}")
+                
+                # Get file content
+                shared_content = await get_shared_content(f_key)
+                if shared_content:
+                    try:
+                        # Send the file
+                        await send_shared_content(context, user_id, shared_content)
+                        log.info(f"✅ Auto-sent file {f_key} to user {user_id}")
+                        
+                        # Update user interaction
+                        await db.update_user_interaction(
+                            user_id=user_id,
+                            username=user.username,
+                            first_name=user.first_name,
+                            last_name=user.last_name,
+                            file_accessed=True
+                        )
+                        
+                        # Remove pending delivery
+                        await db.remove_pending_delivery(user_id, f_key)
+                        
+                    except Exception as e:
+                        log.error(f"❌ Failed to auto-send file to user {user_id}: {e}")
+                        
+    except Exception as e:
+        log.error(f"Error in chat_join_request_handler: {e}", exc_info=True)
 
 # ============ WEB ROUTES ============
 @app.route('/')
@@ -2577,8 +2679,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.info(f"✅ User {user_id} has joined all channels. Sending file...")
         await db.update_user_interaction(user_id=user_id, file_accessed=True)
 
+        sending_msg = await update.message.reply_text("⏳ Bot sending files...")
+
         try:
             sent_items = await send_shared_content(context, chat_id, shared_content)
+            
+            try:
+                await sending_msg.delete()
+            except Exception as e:
+                log.warning(f"Could not delete sending message: {e}")
             log.info(f"Sent {len(sent_items)} file(s) successfully to user {user_id}")
             
             # Clean up any pending deliveries
@@ -3058,9 +3167,39 @@ async def removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not context.args:
+        # Check if replying to a forwarded message
+        if update.message.reply_to_message:
+            forwarded = update.message.reply_to_message
+            chat = extract_chat_from_forward(forwarded)
+            if chat:
+                channel_id = str(chat.id)
+                chat_username = chat.username or channel_id
+                
+                success = await db.remove_channel(chat_username)
+                if not success and chat_username != channel_id:
+                    success = await db.remove_channel(channel_id)
+                    
+                if success:
+                    channels = await db.get_channels_with_details()
+                    active_channels = [c for c in channels if c['is_active'] == 1]
+                    if active_channels:
+                        channel_list = "\n".join([f"{i+1}. {c['channel_name'] or c['channel_username']} ({c.get('channel_type', 'public')})" for i, c in enumerate(active_channels)])
+                    else:
+                        channel_list = "No channels required (all access granted)"
+                    
+                    sent_msg = await update.message.reply_text(
+                        f"✅ *Channel removed successfully!*\n\n"
+                        f"Removed: @{chat_username.replace('@', '')}\n\n"
+                        f"📋 *Current required channels:*\n{channel_list}",
+                        parse_mode="Markdown"
+                    )
+                    await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+                    return
+
         sent_msg = await update.message.reply_text(
             "❌ Usage: /removechannel <channel username>\n"
-            "Example: /removechannel @my_channel"
+            "Example: /removechannel @my_channel\n"
+            "Or reply to a forwarded message from the channel with /removechannel"
         )
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
@@ -4420,6 +4559,10 @@ async def initialize_bot():
         chat_member_handler,
         ChatMemberHandler.CHAT_MEMBER
     ))
+    
+    # Add chat join request handler
+    from telegram.ext import ChatJoinRequestHandler
+    application.add_handler(ChatJoinRequestHandler(chat_join_request_handler))
 
     # Set webhook
     render_url = os.environ.get('RENDER_EXTERNAL_URL')
