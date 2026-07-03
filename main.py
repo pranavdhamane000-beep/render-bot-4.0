@@ -2680,6 +2680,7 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if is_private:
                 # Private channel - need to create invite link
                 try:
+                    # Get channel reference
                     channel_ref = int(channel_id) if channel_id.lstrip('-').isdigit() else channel_id
                     
                     # Check if bot is admin
@@ -2717,6 +2718,11 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     
                     if success:
+                        # Get updated channel list
+                        channels = await db.get_channels_with_details()
+                        active_channels = [c for c in channels if c['is_active'] == 1]
+                        channel_list = "\n".join([f"{i+1}. {c['channel_name'] or c['channel_username']} ({c.get('channel_type', 'public')})" for i, c in enumerate(active_channels)])
+                        
                         sent_msg = await update.message.reply_text(
                             f"✅ *Private Channel Added Successfully!*\n\n"
                             f"📢 Channel: {channel_title}\n"
@@ -2724,7 +2730,8 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             f"🔗 Invite Link: [Click Here]({invite_link.invite_link})\n"
                             f"📝 Type: Private\n\n"
                             f"Users can now request to join this channel.\n"
-                            f"Use `/approve` to approve pending requests.",
+                            f"Use `/approve` to approve pending requests.\n\n"
+                            f"📋 *Current required channels:*\n{channel_list}",
                             parse_mode="Markdown",
                             disable_web_page_preview=True
                         )
@@ -2754,12 +2761,18 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 
                 if success:
+                    # Get updated channel list
+                    channels = await db.get_channels_with_details()
+                    active_channels = [c for c in channels if c['is_active'] == 1]
+                    channel_list = "\n".join([f"{i+1}. {c['channel_name'] or c['channel_username']} ({c.get('channel_type', 'public')})" for i, c in enumerate(active_channels)])
+                    
                     sent_msg = await update.message.reply_text(
                         f"✅ *Public Channel Added Successfully!*\n\n"
                         f"📢 Channel: {channel_title}\n"
                         f"@: @{channel_username}\n"
                         f"📝 Type: Public\n\n"
-                        f"Users must join this channel to access files.",
+                        f"Users must join this channel to access files.\n\n"
+                        f"📋 *Current required channels:*\n{channel_list}",
                         parse_mode="Markdown"
                     )
                 else:
@@ -2769,11 +2782,12 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
         
         else:
-            # Not a forwarded message
+            # Not a forwarded message from a channel
             sent_msg = await update.message.reply_text(
                 "❌ *Please forward a message from the channel and reply with /addchannel*\n\n"
                 "Usage: Forward a message from the channel, then reply to it with:\n"
-                "/addchannel [friendly name]",
+                "/addchannel [friendly name]\n\n"
+                "💡 The bot will automatically detect if it's a public or private channel.",
                 parse_mode="Markdown"
             )
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
@@ -2902,17 +2916,18 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     log.info(f"📝 Approving requests for channel: {channel_title} (ID: {channel_id})")
     
-    # Get channel from database
+    # Get channel from database - try exact match first
     channel_data = await db.fetchrow(
         "SELECT id, channel_username, channel_name, invite_link FROM required_channels WHERE channel_username = %s AND is_active = 1",
         (channel_id,)
     )
     
     if not channel_data:
-        # Try without normalization
+        # Try without leading dash
+        clean_id = channel_id.lstrip('-')
         channel_data = await db.fetchrow(
             "SELECT id, channel_username, channel_name, invite_link FROM required_channels WHERE channel_username = %s AND is_active = 1",
-            (channel_id.lstrip('-'),)
+            (clean_id,)
         )
     
     if not channel_data:
