@@ -1389,7 +1389,12 @@ async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bo
         else:
             return False, error_msg
 
-async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, force_check: bool = False) -> Dict[str, Any]:
+async def check_membership(
+    user_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    force_check: bool = False,
+    allow_private_requests: bool = False
+) -> Dict[str, Any]:
     """Check if user is member of all required channels"""
     bot = context.bot
 
@@ -1424,7 +1429,7 @@ async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE, for
         is_member, verification_error = await check_user_in_channel(bot, channel, user_id, force_check)
         
         # ADD THIS: Check for private channel request
-        if not is_member and channel_type == 'private':
+        if allow_private_requests and not is_member and channel_type == 'private':
             has_request = await db.has_private_request(user_id, channel_id)
             if has_request:
                 log.info(f"User {user_id} has requested to join private {channel_name}. Treating as member for file access.")
@@ -2765,7 +2770,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("❌ File not found")
                 return
 
-            result = await check_membership(user_id, context, force_check=True)
+            result = await check_membership(
+                user_id,
+                context,
+                force_check=True
+            )
 
             if result['all_joined']:
                 # User now has all channels - send file
@@ -3140,15 +3149,40 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     approved_count = 0
+    join_approved_count = 0
+    join_already_member_count = 0
     failed_count = 0
     already_sent_count = 0
     waiting_count = 0
+    approve_chat_id = int(channel_id) if channel_id.lstrip('-').isdigit() else channel_id
     
     for request in pending_requests:
         user_id = request['user_id']
         file_key = request['file_key']
         
         try:
+            try:
+                await context.bot.approve_chat_join_request(
+                    chat_id=approve_chat_id,
+                    user_id=user_id
+                )
+                join_approved_count += 1
+                log.info(f"Approved Telegram join request for user {user_id} in {channel_name}")
+            except Exception as approve_error:
+                actual_member, _ = await check_user_in_channel(
+                    context.bot,
+                    channel_id,
+                    user_id,
+                    force_check=True
+                )
+                if actual_member:
+                    join_already_member_count += 1
+                    log.info(f"User {user_id} is already a member of {channel_name}; continuing delivery checks.")
+                else:
+                    log.error(f"Failed to approve Telegram join request for user {user_id} in {channel_name}: {approve_error}")
+                    failed_count += 1
+                    continue
+
             if using_delivery_fallback or request.get('from_pending_delivery'):
                 await db.add_private_request(user_id, db_channel_id, file_key)
 
@@ -3161,7 +3195,12 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     continue
 
             # Check if user is now a member
-            result = await check_membership(user_id, context, force_check=True)
+            result = await check_membership(
+                user_id,
+                context,
+                force_check=True,
+                allow_private_requests=True
+            )
             
             if result['all_joined']:
                 # User has all channels - send file
@@ -3215,7 +3254,9 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent_msg = await update.message.reply_text(
         f"✅ *Approval Complete*\n\n"
         f"📢 Channel: {channel_name}\n"
-        f"✅ Successfully approved: {approved_count} users\n"
+        f"✅ Join requests approved: {join_approved_count} users\n"
+        f"👤 Already members: {join_already_member_count} users\n"
+        f"📁 Files sent: {approved_count} users\n"
         f"⏳ Waiting for other channels: {waiting_count} users\n"
         f"❌ Failed: {failed_count} users\n"
         f"⏭️ Already processed: {already_sent_count} users\n"
