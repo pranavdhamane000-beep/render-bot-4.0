@@ -17,6 +17,7 @@ from contextlib import asynccontextmanager
 import urllib.parse
 import csv
 import io
+import html
 
 # ================= HEALTH SERVER FOR RENDER =================
 from flask import Flask, render_template_string, jsonify, request
@@ -2662,13 +2663,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Create appropriate message
             safe_missing_names = [escape_markdown(name) for name in missing_names]
+            has_private_missing = any(t == 'private' for t in missing_types)
+            has_public_missing = any(t != 'private' for t in missing_types)
+            action_text = "Join or request access to" if has_private_missing and has_public_missing else (
+                "Request access to" if has_private_missing else "Join"
+            )
             if len(safe_missing_names) == 1:
-                text = f"🔒 Join {safe_missing_names[0]} to access this file"
+                text = f"🔒 {action_text} {safe_missing_names[0]} to access this file"
             elif len(safe_missing_names) == 2:
-                text = f"🔒 Join {safe_missing_names[0]} and {safe_missing_names[1]} to access this file"
+                text = f"🔒 {action_text} {safe_missing_names[0]} and {safe_missing_names[1]} to access this file"
             else:
                 channels_text = ", ".join(safe_missing_names[:-1]) + f" and {safe_missing_names[-1]}"
-                text = f"🔒 Join {channels_text} to access this file"
+                text = f"🔒 {action_text} {channels_text} to access this file"
 
             if verification_errors:
                 unresolved = ", ".join(markdown_code(item["name"]) for item in verification_errors)
@@ -3099,6 +3105,7 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     approved_count = 0
     failed_count = 0
     already_sent_count = 0
+    waiting_count = 0
     
     for request in pending_requests:
         user_id = request['user_id']
@@ -3146,10 +3153,11 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     log.error(f"❌ File {file_key} not found for user {user_id}")
                     failed_count += 1
             else:
-                # Still missing channels - clear request for this channel
-                await db.clear_user_requests(user_id, db_channel_id)
-                log.info(f"User {user_id} still missing channels. Request cleared for {channel_name}")
-                failed_count += 1
+                # Keep the private request recorded. A pending/manual approval
+                # request counts as satisfied for private channels; any missing
+                # public channels can still be joined later.
+                log.info(f"User {user_id} still missing other channels. Keeping private request for {channel_name}.")
+                waiting_count += 1
                 
         except Exception as e:
             log.error(f"❌ Error processing user {user_id}: {e}")
@@ -3160,6 +3168,7 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ *Approval Complete*\n\n"
         f"📢 Channel: {channel_name}\n"
         f"✅ Successfully approved: {approved_count} users\n"
+        f"⏳ Waiting for other channels: {waiting_count} users\n"
         f"❌ Failed: {failed_count} users\n"
         f"⏭️ Already processed: {already_sent_count} users\n"
         f"📊 Total processed: {len(pending_requests)}",
@@ -3249,9 +3258,9 @@ async def listchannels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not channels:
         sent_msg = await update.message.reply_text(
-            "📋 *No channels configured*\n\n"
+            "📋 <b>No channels configured</b>\n\n"
             "Use /addchannel to add required channels.",
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
@@ -3259,8 +3268,8 @@ async def listchannels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active_channels = [c for c in channels if c['is_active'] == 1]
     inactive_channels = [c for c in channels if c['is_active'] == 0]
     
-    msg = f"📋 *Channel Management*\n\n"
-    msg += f"📢 *Active Channels ({len(active_channels)}):*\n"
+    msg = f"📋 <b>Channel Management</b>\n\n"
+    msg += f"📢 <b>Active Channels ({len(active_channels)}):</b>\n"
     
     for i, ch in enumerate(active_channels):
         added_at = ch['added_at']
@@ -3270,27 +3279,30 @@ async def listchannels(update: Update, context: ContextTypes.DEFAULT_TYPE):
             added_date = 'Unknown'
         channel_type = ch.get('channel_type', 'public')
         type_emoji = "🔒" if channel_type == 'private' else "📢"
-        display_name = escape_markdown(str(ch['channel_name'] or ch['channel_username']))
+        display_name = html.escape(str(ch['channel_name'] or ch['channel_username']))
+        channel_username = html.escape(str(ch['channel_username']))
         msg += f"{i+1}. {type_emoji} {display_name}\n"
-        msg += f"   └ Username: @{ch['channel_username']}\n"
-        msg += f"   └ Type: {channel_type}\n"
+        msg += f"   └ Username/ID: {channel_username}\n"
+        msg += f"   └ Type: {html.escape(str(channel_type))}\n"
         msg += f"   └ Added: {added_date}\n"
         if channel_type == 'private' and ch.get('invite_link'):
-            msg += f"   └ Invite: [Link]({ch['invite_link']})\n"
+            invite_link = html.escape(str(ch['invite_link']), quote=True)
+            msg += f"   └ Invite Request: <a href=\"{invite_link}\">Link</a>\n"
     
     if inactive_channels:
-        msg += f"\n⏸️ *Inactive Channels ({len(inactive_channels)}):*\n"
+        msg += f"\n⏸️ <b>Inactive Channels ({len(inactive_channels)}):</b>\n"
         for i, ch in enumerate(inactive_channels):
-            display_name = escape_markdown(str(ch['channel_name'] or ch['channel_username']))
-            msg += f"{i+1}. {display_name} (@{ch['channel_username']})\n"
+            display_name = html.escape(str(ch['channel_name'] or ch['channel_username']))
+            channel_username = html.escape(str(ch['channel_username']))
+            msg += f"{i+1}. {display_name} ({channel_username})\n"
     
-    msg += f"\n💡 *Commands:*\n"
+    msg += f"\n💡 <b>Commands:</b>\n"
     msg += f"/addchannel - Add channel (reply to forwarded message for private)\n"
     msg += f"/approve - Approve pending requests (reply to forwarded message)\n"
     msg += f"/removechannel @channel - Remove channel\n"
     msg += f"/testchannels - Test bot access to all channels"
     
-    sent_msg = await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
+    sent_msg = await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def testchannels(update: Update, context: ContextTypes.DEFAULT_TYPE):
