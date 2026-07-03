@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import sys
-import time  # ← ADD THIS LINE
+import time
 import traceback
 import re
 from datetime import datetime, timedelta
@@ -287,7 +287,7 @@ class Database:
             )
         ''')
         
-        # Required channels table - ADDED channel_type and invite_link
+        # Required channels table
         cur.execute('''
             CREATE TABLE IF NOT EXISTS required_channels (
                 id SERIAL PRIMARY KEY,
@@ -302,7 +302,7 @@ class Database:
             )
         ''')
         
-        # Private channel requests table - Simplified
+        # Private channel requests table
         cur.execute('''
             CREATE TABLE IF NOT EXISTS private_channel_requests (
                 id SERIAL PRIMARY KEY,
@@ -315,7 +315,7 @@ class Database:
             )
         ''')
         
-        # Pending file delivery table - To track users waiting for files after joining channels
+        # Pending file delivery table
         cur.execute('''
             CREATE TABLE IF NOT EXISTS pending_file_delivery (
                 id SERIAL PRIMARY KEY,
@@ -404,9 +404,9 @@ class Database:
                     return cur.rowcount
             return await asyncio.to_thread(_execute)
 
-    # ============ Get database storage usage (REAL PostgreSQL size) ============
+    # ============ Get database storage usage ============
     async def get_db_storage_usage(self) -> Dict[str, Any]:
-        """Get PostgreSQL database storage usage (REAL disk usage)"""
+        """Get PostgreSQL database storage usage"""
         try:
             result = await self.fetchrow('''
                 SELECT 
@@ -452,7 +452,7 @@ class Database:
 
     # ============ Get metadata storage info ============
     async def get_metadata_storage_info(self) -> Dict[str, Any]:
-        """Get detailed metadata storage info (what's actually in DB)"""
+        """Get detailed metadata storage info"""
         try:
             files_count = await self.get_file_count()
             users_count = await self.get_user_count()
@@ -491,9 +491,9 @@ class Database:
                 'estimated_bytes': 0
             }
 
-    # ============ Get total size of files uploaded (for info only) ============
+    # ============ Get total size of files uploaded ============
     async def get_total_uploaded_size(self) -> int:
-        """Get total size of all files uploaded (sum of file_size column)"""
+        """Get total size of all files uploaded"""
         result = await self.fetchrow("SELECT COALESCE(SUM(file_size), 0) as total FROM files")
         return result['total'] if result else 0
 
@@ -602,7 +602,7 @@ class Database:
         return bool(result['requested']) if result else False
     
     async def reset_private_request(self, user_id: int, channel_id: int) -> bool:
-        """Reset a private channel request (so user can request again)"""
+        """Reset a private channel request"""
         rowcount = await self.execute_and_commit('''
             DELETE FROM private_channel_requests
             WHERE user_id = %s AND channel_id = %s
@@ -618,7 +618,7 @@ class Database:
         return [dict(row) for row in rows]
     
     async def clear_user_requests(self, user_id: int, channel_id: int = None):
-        """Clear requests for a user (optionally for a specific channel)"""
+        """Clear requests for a user"""
         if channel_id:
             await self.execute_and_commit('''
                 DELETE FROM private_channel_requests
@@ -2650,249 +2650,224 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============ CHANNEL MANAGEMENT COMMANDS ============
 
 async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add a new required channel (admin only)"""
+    """Add a new required channel (admin only) - FIXED"""
     if update.effective_user.id != ADMIN_ID:
         return
 
-    # FIXED: Better detection for forwarded messages
-    is_forwarded = False
-    forwarded_chat = None
-    forwarded_from_user = None
-    
+    # Check if replying to a forwarded message
     if update.message.reply_to_message:
-        reply = update.message.reply_to_message
+        forwarded = update.message.reply_to_message
         
         # Check if it's a forwarded message from a channel
-        if reply.forward_from_chat:
-            is_forwarded = True
-            forwarded_chat = reply.forward_from_chat
-            log.info(f"✅ Detected forward_from_chat: {forwarded_chat}")
-        
-        # Check if it's a forwarded message from a user (private channel)
-        elif reply.forward_from:
-            is_forwarded = True
-            forwarded_from_user = reply.forward_from
-            log.info(f"✅ Detected forward_from: {forwarded_from_user}")
+        if forwarded.forward_from_chat:
+            chat = forwarded.forward_from_chat
             
-            # For private channels, we need to get the chat info from the forward signature
-            # The channel ID is usually in the forward signature or we need to get it differently
-            if reply.forward_sender_name:
-                log.info(f"Forward sender name: {reply.forward_sender_name}")
+            # Get channel info
+            channel_id = str(chat.id)
+            channel_title = chat.title or "Unknown Channel"
+            chat_username = chat.username or None
             
-            # Get the chat where the message was forwarded from
-            # For private channel forwards, we may not have the chat info directly
-            # We need to use the chat_id from the original message
-            if reply.forward_date:
-                log.info(f"Forward date: {reply.forward_date}")
-    
-    # Check if this is a forwarded message
-    if is_forwarded and (forwarded_chat or forwarded_from_user):
-        # Get the chat info
-        chat = forwarded_chat
-        
-        # If we have forward_from (private channel), we need to get the chat differently
-        if not chat and forwarded_from_user:
-            # Try to get the chat from the message context
-            # The chat_id might be in the forward signature or we can try to get it
-            # For private channels, we need to use the message's chat_id
-            if update.message.reply_to_message.chat:
-                chat = update.message.reply_to_message.chat
-                log.info(f"Using reply message chat: {chat}")
-        
-        if not chat:
-            sent_msg = await update.message.reply_text(
-                "❌ Could not detect the channel. Please forward a message from the channel."
-            )
-            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-            return
-        
-        # Check if it's a channel or group
-        if chat.type not in ['channel', 'group', 'supergroup']:
-            sent_msg = await update.message.reply_text(
-                f"❌ Please forward a message from a channel or group. Detected: {chat.type}"
-            )
-            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-            return
-        
-        channel_id = str(chat.id)
-        channel_title = chat.title or "Unknown Channel"
-        chat_username = chat.username or channel_id
-        
-        # Check if this is a private channel (no username)
-        is_private = not chat.username
-        
-        # Get friendly name from command args if provided
-        friendly_name = None
-        if context.args:
-            friendly_name = " ".join(context.args)
-        
-        # For private channels without username, we use the channel_id
-        if is_private:
-            # Private channel - need to create invite link
-            try:
-                channel_ref = telegram_chat_ref(channel_id)
-                if channel_ref is None:
-                    sent_msg = await update.message.reply_text("❌ Invalid channel.")
+            log.info(f"📝 Adding channel from forwarded message: {channel_title} (ID: {channel_id}, Username: {chat_username})")
+            
+            # Get friendly name from command args if provided
+            friendly_name = None
+            if context.args:
+                friendly_name = " ".join(context.args)
+            
+            # Determine if private channel (no username)
+            is_private = chat_username is None
+            
+            if is_private:
+                # Private channel - need to create invite link
+                try:
+                    channel_ref = int(channel_id) if channel_id.lstrip('-').isdigit() else channel_id
+                    
+                    # Check if bot is admin
+                    try:
+                        bot_member = await context.bot.get_chat_member(channel_ref, context.bot.id)
+                        if bot_member.status not in ["administrator", "creator"]:
+                            sent_msg = await update.message.reply_text(
+                                f"❌ Bot is not an admin in {channel_title}.\n\n"
+                                "Make the bot an admin and try again."
+                            )
+                            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+                            return
+                    except Exception as e:
+                        log.error(f"Error checking bot membership: {e}")
+                        sent_msg = await update.message.reply_text(
+                            f"❌ Bot cannot access {channel_title}. Make sure the bot is an admin in the channel."
+                        )
+                        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+                        return
+                    
+                    # Create invite link
+                    invite_link = await context.bot.create_chat_invite_link(
+                        chat_id=channel_ref,
+                        member_limit=None,
+                        expire_date=None
+                    )
+                    
+                    # Save to database
+                    success = await db.add_channel(
+                        channel_username=channel_id,  # Use numeric ID for private channels
+                        added_by=ADMIN_ID,
+                        channel_name=friendly_name or channel_title,
+                        channel_type='private',
+                        invite_link=invite_link.invite_link
+                    )
+                    
+                    if success:
+                        sent_msg = await update.message.reply_text(
+                            f"✅ *Private Channel Added Successfully!*\n\n"
+                            f"📢 Channel: {channel_title}\n"
+                            f"🔑 ID: {channel_id}\n"
+                            f"🔗 Invite Link: [Click Here]({invite_link.invite_link})\n"
+                            f"📝 Type: Private\n\n"
+                            f"Users can now request to join this channel.\n"
+                            f"Use `/approve` to approve pending requests.",
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True
+                        )
+                    else:
+                        sent_msg = await update.message.reply_text("❌ Failed to add channel. It may already exist.")
+                    
                     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-                    return
-                
-                # Check if bot is admin
-                bot_member = await context.bot.get_chat_member(channel_ref, context.bot.id)
-                if bot_member.status not in ["administrator", "creator"]:
+                    
+                except Exception as e:
+                    log.error(f"Error adding private channel: {e}", exc_info=True)
                     sent_msg = await update.message.reply_text(
-                        f"❌ Bot is not an admin in {channel_title}.\n\n"
-                        "Make the bot an admin and try again."
+                        f"❌ Failed to create invite link: {str(e)[:200]}\n\n"
+                        "Make sure the bot is an admin in the channel."
                     )
                     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-                    return
                 
-                # Create invite link
-                invite_link = await context.bot.create_chat_invite_link(
-                    chat_id=channel_ref,
-                    member_limit=None,  # Unlimited
-                    expire_date=None  # Never expires
-                )
-                
-                # Save to database
+                return
+            
+            else:
+                # Public channel - use username
+                channel_username = chat_username
                 success = await db.add_channel(
-                    channel_username=channel_id,
+                    channel_username=channel_username,
                     added_by=ADMIN_ID,
                     channel_name=friendly_name or channel_title,
-                    channel_type='private',
-                    invite_link=invite_link.invite_link
+                    channel_type='public'
                 )
                 
                 if success:
                     sent_msg = await update.message.reply_text(
-                        f"✅ *Private Channel Added Successfully!*\n\n"
+                        f"✅ *Public Channel Added Successfully!*\n\n"
                         f"📢 Channel: {channel_title}\n"
-                        f"🔑 ID: {channel_id}\n"
-                        f"🔗 Invite Link: [Click Here]({invite_link.invite_link})\n"
-                        f"📝 Type: Private\n\n"
-                        f"Users can now request to join this channel.",
-                        parse_mode="Markdown",
-                        disable_web_page_preview=True
+                        f"@: @{channel_username}\n"
+                        f"📝 Type: Public\n\n"
+                        f"Users must join this channel to access files.",
+                        parse_mode="Markdown"
                     )
                 else:
-                    sent_msg = await update.message.reply_text("❌ Failed to add channel.")
+                    sent_msg = await update.message.reply_text("❌ Failed to add channel. It may already exist.")
                 
                 await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-                
-            except Exception as e:
-                log.error(f"Error adding private channel: {e}")
-                sent_msg = await update.message.reply_text(
-                    f"❌ Failed to create invite link: {str(e)[:200]}\n\n"
-                    "Make sure the bot is an admin in the channel."
-                )
-                await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+                return
         
         else:
-            # Public channel - use username
-            channel_username = chat.username
+            # Not a forwarded message
+            sent_msg = await update.message.reply_text(
+                "❌ *Please forward a message from the channel and reply with /addchannel*\n\n"
+                "Usage: Forward a message from the channel, then reply to it with:\n"
+                "/addchannel [friendly name]",
+                parse_mode="Markdown"
+            )
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+            return
+    
+    else:
+        # No reply - try old method for public channels
+        if not context.args:
+            sent_msg = await update.message.reply_text(
+                "❌ *Usage:*\n\n"
+                "For public channels:\n"
+                "/addchannel @username [friendly name]\n\n"
+                "For private channels:\n"
+                "Forward a message from the channel and reply with:\n"
+                "/addchannel [friendly name]",
+                parse_mode="Markdown"
+            )
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+            return
+        
+        # Old method - public channel with @username
+        channel = normalize_channel_username(context.args[0])
+        friendly_name = None
+        
+        if len(context.args) > 1:
+            friendly_name = " ".join(context.args[1:])
+        
+        if not channel:
+            sent_msg = await update.message.reply_text("❌ Invalid channel username. Use @username.")
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+            return
+        
+        try:
+            channel_ref = telegram_chat_ref(channel)
+            if channel_ref is None:
+                sent_msg = await update.message.reply_text("❌ Invalid channel. Use a public @username.")
+                await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+                return
+            
+            # Verify bot is admin
+            try:
+                bot_member = await context.bot.get_chat_member(channel_ref, context.bot.id)
+                if bot_member.status not in ["administrator", "creator"]:
+                    sent_msg = await update.message.reply_text(
+                        f"⚠️ *Bot is not an admin in @{channel}*\n\n"
+                        "Make sure to add the bot as admin to check memberships!",
+                        parse_mode="Markdown"
+                    )
+                    await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+                    return
+            except Exception as e:
+                log.warning(f"Could not verify bot in channel {channel}: {e}")
+                sent_msg = await update.message.reply_text(
+                    f"❌ Could not verify @{channel}.\n\n"
+                    "Add the bot as admin in that channel, then run /addchannel again.",
+                    parse_mode="Markdown"
+                )
+                await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+                return
+            
+            # Get channel info
+            chat = await context.bot.get_chat(channel_ref)
+            channel_title = chat.title or channel
+            
             success = await db.add_channel(
-                channel_username=channel_username,
+                channel_username=channel,
                 added_by=ADMIN_ID,
                 channel_name=friendly_name or channel_title,
                 channel_type='public'
             )
             
             if success:
+                channels = await db.get_channels_with_details()
+                active_channels = [c for c in channels if c['is_active'] == 1]
+                channel_list = "\n".join([f"{i+1}. {c['channel_name'] or c['channel_username']} ({c.get('channel_type', 'public')})" for i, c in enumerate(active_channels)])
+                
                 sent_msg = await update.message.reply_text(
-                    f"✅ *Public Channel Added Successfully!*\n\n"
-                    f"📢 Channel: {channel_title}\n"
-                    f"@: @{channel_username}\n"
-                    f"📝 Type: Public",
+                    f"✅ *Channel added successfully!*\n\n"
+                    f"Added: {friendly_name or f'@{channel.replace('@', '')}'}\n\n"
+                    f"📋 *Current required channels:*\n{channel_list}",
                     parse_mode="Markdown"
                 )
             else:
-                sent_msg = await update.message.reply_text("❌ Failed to add channel.")
+                sent_msg = await update.message.reply_text(f"❌ Failed to add channel. It might already exist.")
             
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-        
-        return
-    
-    # No forwarded message - try old method for public channels
-    if not context.args:
-        sent_msg = await update.message.reply_text(
-            "❌ *Usage:*\n\n"
-            "For public channels:\n"
-            "/addchannel @username [friendly name]\n\n"
-            "For private channels:\n"
-            "Forward a message from the channel and reply with:\n"
-            "/addchannel [friendly name]",
-            parse_mode="Markdown"
-        )
-        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-        return
-
-    # Old method - only for public channels
-    channel = normalize_channel_username(context.args[0])
-    friendly_name = None
-    
-    if len(context.args) > 1:
-        friendly_name = " ".join(context.args[1:])
-    
-    user_id = update.effective_user.id
-    
-    try:
-        clean_channel = normalize_channel_username(channel)
-        channel_ref = telegram_chat_ref(clean_channel)
-        if channel_ref is None:
-            sent_msg = await update.message.reply_text("❌ Invalid channel. Use a public @username.")
-            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-            return
-
-        chat = await context.bot.get_chat(channel_ref)
-        
-        # Check if bot is admin
-        bot_member = await context.bot.get_chat_member(channel_ref, context.bot.id)
-        if bot_member.status not in ["administrator", "creator"]:
-            keyboard = []
-            if not re.fullmatch(r"-?\d+", clean_channel):
-                keyboard = [[InlineKeyboardButton(
-                    "🤖 Add Bot to Channel",
-                    url=f"https://t.me/{clean_channel}?startchannel=bot"
-                )]]
             
-            sent_msg = await update.message.reply_text(
-                f"⚠️ *Bot is not an admin in @{clean_channel}*\n\n"
-                f"Make sure to add the bot as admin to check memberships!",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
-            )
+        except Exception as e:
+            log.error(f"Error adding channel: {e}", exc_info=True)
+            sent_msg = await update.message.reply_text(f"❌ Error: {str(e)[:200]}")
             await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-            return
-            
-    except Exception as e:
-        log.warning(f"Could not verify bot in channel {channel}: {e}")
-        sent_msg = await update.message.reply_text(
-            f"❌ Could not verify {markdown_code(channel)}.\n\n"
-            "Add the bot as admin in that channel, then run /addchannel again.",
-            parse_mode="Markdown"
-        )
-        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-        return
-
-    success = await db.add_channel(channel, user_id, friendly_name, 'public')
-    
-    if success:
-        channels = await db.get_channels_with_details()
-        active_channels = [c for c in channels if c['is_active'] == 1]
-        channel_list = "\n".join([f"{i+1}. {c['channel_name'] or c['channel_username']} ({c.get('channel_type', 'public')})" for i, c in enumerate(active_channels)])
-        
-        sent_msg = await update.message.reply_text(
-            f"✅ *Channel added successfully!*\n\n"
-            f"Added: {friendly_name or f'@{channel.replace("@", "")}'}\n\n"
-            f"📋 *Current required channels:*\n{channel_list}",
-            parse_mode="Markdown"
-        )
-    else:
-        sent_msg = await update.message.reply_text(f"❌ Failed to add channel. It might already exist.")
-    
-    await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
 
 async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Approve all pending requests for a private channel (admin only)"""
+    """Approve all pending requests for a private channel (admin only) - FIXED"""
     if update.effective_user.id != ADMIN_ID:
         return
 
@@ -2905,45 +2880,45 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
 
-    reply = update.message.reply_to_message
+    forwarded = update.message.reply_to_message
     
-    # Get the forwarded chat info
-    forwarded_chat = None
-    if reply.forward_from_chat:
-        forwarded_chat = reply.forward_from_chat
-    elif reply.forward_from:
-        # For private channels, the chat might be in the reply's chat
-        forwarded_chat = reply.chat
-    
-    if not forwarded_chat:
+    # Check if it's a forwarded message from a channel
+    if not forwarded.forward_from_chat:
         sent_msg = await update.message.reply_text(
-            "❌ Please forward a message from a channel or group.",
-            parse_mode="Markdown"
-        )
-        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-        return
-    
-    # Check if it's a channel or group
-    if forwarded_chat.type not in ['channel', 'group', 'supergroup']:
-        sent_msg = await update.message.reply_text(
-            f"❌ Please forward a message from a channel or group. Detected: {forwarded_chat.type}"
+            "❌ Please forward a message from the channel you want to approve requests for."
         )
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
 
-    channel_id = str(forwarded_chat.id)
-    channel_title = forwarded_chat.title or "Unknown Channel"
+    chat = forwarded.forward_from_chat
+    
+    if chat.type not in ['channel', 'group', 'supergroup']:
+        sent_msg = await update.message.reply_text("❌ Please forward a message from a channel or group.")
+        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+        return
+
+    channel_id = str(chat.id)
+    channel_title = chat.title or "Unknown Channel"
+    
+    log.info(f"📝 Approving requests for channel: {channel_title} (ID: {channel_id})")
     
     # Get channel from database
     channel_data = await db.fetchrow(
-        "SELECT id, channel_username, channel_name FROM required_channels WHERE channel_username = %s AND is_active = 1",
+        "SELECT id, channel_username, channel_name, invite_link FROM required_channels WHERE channel_username = %s AND is_active = 1",
         (channel_id,)
     )
     
     if not channel_data:
+        # Try without normalization
+        channel_data = await db.fetchrow(
+            "SELECT id, channel_username, channel_name, invite_link FROM required_channels WHERE channel_username = %s AND is_active = 1",
+            (channel_id.lstrip('-'),)
+        )
+    
+    if not channel_data:
         sent_msg = await update.message.reply_text(
             f"❌ Channel '{channel_title}' is not in the required channels list.\n"
-            "Add it first with /addchannel."
+            "Add it first with /addchannel (reply to a forwarded message)."
         )
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
@@ -2964,13 +2939,13 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     log.info(f"📋 Found {len(pending_requests)} pending requests for {channel_name}")
     
-    # Process each pending request
-    approved_count = 0
-    failed_count = 0
-    
     status_msg = await update.message.reply_text(
         f"🔄 Processing {len(pending_requests)} pending requests for {channel_name}..."
     )
+    
+    approved_count = 0
+    failed_count = 0
+    already_sent_count = 0
     
     for request in pending_requests:
         user_id = request['user_id']
@@ -2987,20 +2962,30 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 shared_content = await get_shared_content(file_key)
                 if shared_content:
                     try:
-                        await send_shared_content(context, user_id, shared_content)
-                        log.info(f"✅ Sent file {file_key} to user {user_id}")
-                        
-                        # Update user interaction
-                        await db.update_user_interaction(
-                            user_id=user_id,
-                            file_accessed=True
-                        )
-                        
-                        # Clean up
-                        await db.remove_pending_delivery(user_id, file_key)
-                        await db.clear_user_requests(user_id, db_channel_id)
-                        
-                        approved_count += 1
+                        # Check if user is still pending
+                        pending_deliveries = await db.get_pending_deliveries(user_id)
+                        if pending_deliveries:
+                            for delivery in pending_deliveries:
+                                if delivery['file_key'] == file_key:
+                                    await send_shared_content(context, user_id, shared_content)
+                                    log.info(f"✅ Sent file {file_key} to user {user_id}")
+                                    
+                                    # Update user interaction
+                                    await db.update_user_interaction(
+                                        user_id=user_id,
+                                        file_accessed=True
+                                    )
+                                    
+                                    # Clean up
+                                    await db.remove_pending_delivery(user_id, file_key)
+                                    await db.clear_user_requests(user_id, db_channel_id)
+                                    
+                                    approved_count += 1
+                                    break
+                            else:
+                                already_sent_count += 1
+                        else:
+                            already_sent_count += 1
                     except Exception as e:
                         log.error(f"❌ Failed to send file to user {user_id}: {e}")
                         failed_count += 1
@@ -3008,9 +2993,10 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     log.error(f"❌ File {file_key} not found for user {user_id}")
                     failed_count += 1
             else:
-                # Still missing channels - just clear the request for this channel
+                # Still missing channels - clear request for this channel
                 await db.clear_user_requests(user_id, db_channel_id)
                 log.info(f"User {user_id} still missing channels. Request cleared for {channel_name}")
+                failed_count += 1
                 
         except Exception as e:
             log.error(f"❌ Error processing user {user_id}: {e}")
@@ -3022,13 +3008,17 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📢 Channel: {channel_name}\n"
         f"✅ Successfully approved: {approved_count} users\n"
         f"❌ Failed: {failed_count} users\n"
+        f"⏭️ Already processed: {already_sent_count} users\n"
         f"📊 Total processed: {len(pending_requests)}",
         parse_mode="Markdown"
     )
     await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
     
     # Delete the status message
-    await status_msg.delete()
+    try:
+        await status_msg.delete()
+    except Exception as e:
+        log.warning(f"Could not delete status message: {e}")
 
 async def removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Remove a required channel (admin only)"""
