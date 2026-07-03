@@ -676,6 +676,20 @@ class Database:
             ORDER BY created_at DESC
         ''', (user_id,))
         return [dict(row) for row in rows]
+
+    async def get_pending_deliveries_for_channels(self, channels: List[str]) -> List[Dict]:
+        """Get pending deliveries waiting on any of the given channel identifiers."""
+        clean_channels = [normalize_channel_username(ch) for ch in channels if normalize_channel_username(ch)]
+        if not clean_channels:
+            return []
+
+        rows = await self.fetchall('''
+            SELECT DISTINCT user_id, file_key, missing_channels
+            FROM pending_file_delivery
+            WHERE missing_channels && %s::text[]
+            ORDER BY user_id
+        ''', (clean_channels,))
+        return [dict(row) for row in rows]
     
     async def remove_pending_delivery(self, user_id: int, file_key: str = None):
         """Remove pending delivery for a user"""
@@ -3084,17 +3098,40 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     db_channel_id = channel_data['id']
     channel_name = channel_data['channel_name'] or channel_title
+    channel_identifiers = [
+        channel_data['channel_username'],
+        channel_id,
+        channel_id.lstrip('-'),
+    ]
     
     # Get all pending requests for this channel
     pending_requests = await db.get_pending_requests_for_channel(db_channel_id)
+    using_delivery_fallback = False
     
     if not pending_requests:
-        sent_msg = await update.message.reply_text(
-            f"✅ No pending requests for {channel_name}",
-            parse_mode="Markdown"
-        )
-        await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
-        return
+        fallback_deliveries = await db.get_pending_deliveries_for_channels(channel_identifiers)
+        if fallback_deliveries:
+            using_delivery_fallback = True
+            pending_requests = [
+                {
+                    'user_id': delivery['user_id'],
+                    'file_key': delivery['file_key'],
+                    'from_pending_delivery': True,
+                }
+                for delivery in fallback_deliveries
+            ]
+            log.info(
+                f"No saved join-request rows for {channel_name}; using "
+                f"{len(pending_requests)} pending deliveries as approval fallback."
+            )
+        else:
+            sent_msg = await update.message.reply_text(
+                f"✅ No pending requests for {channel_name}\n\n"
+                "No users are waiting for this private channel in the bot database.",
+                parse_mode="Markdown"
+            )
+            await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
+            return
 
     log.info(f"📋 Found {len(pending_requests)} pending requests for {channel_name}")
     
@@ -3112,6 +3149,17 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_key = request['file_key']
         
         try:
+            if using_delivery_fallback or request.get('from_pending_delivery'):
+                await db.add_private_request(user_id, db_channel_id, file_key)
+
+            if not file_key:
+                pending_deliveries = await db.get_pending_deliveries(user_id)
+                if pending_deliveries:
+                    file_key = pending_deliveries[0]['file_key']
+                else:
+                    already_sent_count += 1
+                    continue
+
             # Check if user is now a member
             result = await check_membership(user_id, context, force_check=True)
             
