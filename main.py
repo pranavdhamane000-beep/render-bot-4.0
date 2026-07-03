@@ -56,6 +56,29 @@ def normalize_channel_username(value: Any) -> str:
     return text
 
 
+def extract_chat_from_forward(forwarded: Any) -> Optional[Any]:
+    """Helper to safely extract the source chat from a forwarded message across API versions."""
+    if hasattr(forwarded, 'forward_origin') and forwarded.forward_origin:
+        origin = forwarded.forward_origin
+        if hasattr(origin, 'chat'):
+            return origin.chat
+        if hasattr(origin, 'sender_chat'):
+            return origin.sender_chat
+    if getattr(forwarded, 'forward_from_chat', None):
+        return forwarded.forward_from_chat
+    if getattr(forwarded, 'sender_chat', None):
+        return forwarded.sender_chat
+    return None
+
+def escape_markdown(text: str) -> str:
+    """Escape markdown characters for Telegram v1."""
+    if not text:
+        return ""
+    for char in ['_', '*', '[', ']', '`']:
+        text = text.replace(char, f'\\{char}')
+    return text
+
+
 def telegram_chat_ref(channel: Any):
     """Return a Telegram API chat reference for a username or numeric chat id."""
     clean_channel = normalize_channel_username(channel)
@@ -2437,7 +2460,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )])
 
             if active_channels:
-                channel_list = "\n".join([f"{i+1}. {c['channel_name'] or f'Channel {i+1}'} ({c.get('channel_type', 'public')})" for i, c in enumerate(active_channels)])
+                channel_list = "\n".join([f"{i+1}. {escape_markdown(c['channel_name'] or f'Channel {i+1}')} ({c.get('channel_type', 'public')})" for i, c in enumerate(active_channels)])
             else:
                 channel_list = "No channels required!"
 
@@ -2521,19 +2544,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         url=f"https://t.me/{channel}"
                     )])
             
-            # Add check status button - just shows current status
-            keyboard.append([InlineKeyboardButton(
-                "📊 Check Status", 
-                callback_data=f"status|{key}"
-            )])
-            
             # Create appropriate message
-            if len(missing_names) == 1:
-                text = f"🔒 *Please join {missing_names[0]} to access this file*\n\n"
-            elif len(missing_names) == 2:
-                text = f"🔒 *Please join {missing_names[0]} and {missing_names[1]} to access this file*\n\n"
+            safe_missing_names = [escape_markdown(name) for name in missing_names]
+            if len(safe_missing_names) == 1:
+                text = f"🔒 *Please join {safe_missing_names[0]} to access this file*\n\n"
+            elif len(safe_missing_names) == 2:
+                text = f"🔒 *Please join {safe_missing_names[0]} and {safe_missing_names[1]} to access this file*\n\n"
             else:
-                channels_text = ", ".join(missing_names[:-1]) + f" and {missing_names[-1]}"
+                channels_text = ", ".join(safe_missing_names[:-1]) + f" and {safe_missing_names[-1]}"
                 text = f"🔒 *Please join {channels_text} to access this file*\n\n"
             
             text += "📌 *How to proceed:*\n"
@@ -2659,8 +2677,8 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         forwarded = update.message.reply_to_message
         
         # Check if it's a forwarded message from a channel
-        if forwarded.forward_from_chat:
-            chat = forwarded.forward_from_chat
+        chat = extract_chat_from_forward(forwarded)
+        if chat:
             
             # Get channel info
             channel_id = str(chat.id)
@@ -2897,14 +2915,13 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     forwarded = update.message.reply_to_message
     
     # Check if it's a forwarded message from a channel
-    if not forwarded.forward_from_chat:
+    chat = extract_chat_from_forward(forwarded)
+    if not chat:
         sent_msg = await update.message.reply_text(
             "❌ Please forward a message from the channel you want to approve requests for."
         )
         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
         return
-
-    chat = forwarded.forward_from_chat
     
     if chat.type not in ['channel', 'group', 'supergroup']:
         sent_msg = await update.message.reply_text("❌ Please forward a message from a channel or group.")
