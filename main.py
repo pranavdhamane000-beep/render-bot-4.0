@@ -3152,6 +3152,7 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     join_approved_count = 0
     join_already_member_count = 0
     failed_count = 0
+    failed_reasons = []
     already_sent_count = 0
     waiting_count = 0
     approve_chat_id = int(channel_id) if channel_id.lstrip('-').isdigit() else channel_id
@@ -3164,7 +3165,7 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.approve_chat_join_request(
                     chat_id=approve_chat_id,
-                    user_id=user_id
+                    user_id=int(user_id)
                 )
                 join_approved_count += 1
                 log.info(f"Approved Telegram join request for user {user_id} in {channel_name}")
@@ -3179,8 +3180,11 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     join_already_member_count += 1
                     log.info(f"User {user_id} is already a member of {channel_name}; continuing delivery checks.")
                 else:
-                    log.error(f"Failed to approve Telegram join request for user {user_id} in {channel_name}: {approve_error}")
+                    error_msg = str(approve_error)
+                    log.error(f"Failed to approve Telegram join request for user {user_id} in {channel_name}: {error_msg}")
                     failed_count += 1
+                    if error_msg not in failed_reasons:
+                        failed_reasons.append(error_msg)
                     continue
 
             if using_delivery_fallback or request.get('from_pending_delivery'):
@@ -3192,6 +3196,8 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     file_key = pending_deliveries[0]['file_key']
                 else:
                     already_sent_count += 1
+                    # We still need to clear their join request so they aren't processed again
+                    await db.clear_user_requests(user_id, db_channel_id)
                     continue
 
             # Check if user is now a member
