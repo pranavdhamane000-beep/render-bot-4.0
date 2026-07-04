@@ -2601,11 +2601,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 channel_list = "No channels required!"
 
             sent_msg = await update.message.reply_text(
-                "🤖 *Welcome to File Sharing Bot*\n\n"
+                "🤖 *Welcome to Bot*\n\n"
                 "🔗 *How to use:*\n"
                 "1️⃣ Use admin-provided links\n"
                 "2️⃣ Join the required channels:\n"
-                f"{channel_list}\n"
                 "3️⃣ After joining, the file will be sent automatically!",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
@@ -2684,7 +2683,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             safe_missing_names = [escape_markdown(name) for name in missing_names]
             has_private_missing = any(t == 'private' for t in missing_types)
             has_public_missing = any(t != 'private' for t in missing_types)
-            action_text = "Join or request access to" if has_private_missing and has_public_missing else (
+            action_text = "Join" if has_private_missing and has_public_missing else (
                 "Request access to" if has_private_missing else "Join"
             )
             if len(safe_missing_names) == 1:
