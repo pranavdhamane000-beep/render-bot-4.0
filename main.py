@@ -2586,7 +2586,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 if channel_type == 'private' and channel_data.get('invite_link'):
                     keyboard.append([InlineKeyboardButton(
-                        f"🔒 Request to Join {channel_name}", 
+                        f"📢 Request to Join {channel_name}", 
                         url=channel_data['invite_link']
                     )])
                 else:
@@ -2665,7 +2665,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     if channel_data and channel_data['invite_link']:
                         keyboard.append([InlineKeyboardButton(
-                            f"🔒 Request to Join {channel_name}", 
+                            f"📢 Request to Join {channel_name}", 
                             url=channel_data['invite_link']
                         )])
                     else:
@@ -2688,16 +2688,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Request access to" if has_private_missing else "Join"
             )
             if len(safe_missing_names) == 1:
-                text = f"🔒 {action_text} {safe_missing_names[0]} to access this file"
+                text = f"🔒 {action_text} {safe_missing_names[0]} to get this file"
             elif len(safe_missing_names) == 2:
-                text = f"🔒 {action_text} {safe_missing_names[0]} and {safe_missing_names[1]} to access this file"
+                text = f"🔒 {action_text} {safe_missing_names[0]} and {safe_missing_names[1]} to get this file"
             else:
                 channels_text = ", ".join(safe_missing_names[:-1]) + f" and {safe_missing_names[-1]}"
-                text = f"🔒 {action_text} {channels_text} to access this file"
+                text = f"🔒 {action_text} {channels_text} to get this file"
 
             if verification_errors:
                 unresolved = ", ".join(markdown_code(item["name"]) for item in verification_errors)
-                text += f"\n\n⚠️ *I couldn't verify:* {unresolved}\nPlease make sure the bot is an admin in those channels."
+                text += f"\n\n File will be provided by Bot."
 
             log.info(f"📨 Sending restriction message to user {user_id} with {len(keyboard)} buttons")
             
