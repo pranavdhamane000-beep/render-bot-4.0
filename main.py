@@ -1544,16 +1544,23 @@ async def chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 shared_content = await get_shared_content(file_key)
                 if shared_content:
                     try:
-                        # Send the file
-                        await send_shared_content(context, user_id, shared_content)
-                        log.info(f"✅ Auto-sent file {file_key} to user {user_id}")
-                        
                         if context and hasattr(context, 'user_data') and 'force_sub_msg_id' in context.user_data:
                             try:
                                 await context.bot.delete_message(chat_id=user_id, message_id=context.user_data['force_sub_msg_id'])
                                 del context.user_data['force_sub_msg_id']
                             except Exception as e:
                                 log.error(f"Failed to delete force sub message: {e}")
+                                
+                        sending_msg = await context.bot.send_message(chat_id=user_id, text="⏳ Bot sending files...")
+                        
+                        # Send the file
+                        await send_shared_content(context, user_id, shared_content)
+                        log.info(f"✅ Auto-sent file {file_key} to user {user_id}")
+                        
+                        try:
+                            await sending_msg.delete()
+                        except Exception as e:
+                            log.warning(f"Could not delete sending message: {e}")
                         
                         # Update user interaction
                         await db.update_user_interaction(
@@ -1648,16 +1655,23 @@ async def chat_join_request_handler(update: Update, context: ContextTypes.DEFAUL
                 shared_content = await get_shared_content(f_key)
                 if shared_content:
                     try:
-                        # Send the file
-                        await send_shared_content(context, user_id, shared_content)
-                        log.info(f"✅ Auto-sent file {f_key} to user {user_id}")
-                        
                         if context and hasattr(context, 'user_data') and 'force_sub_msg_id' in context.user_data:
                             try:
                                 await context.bot.delete_message(chat_id=user_id, message_id=context.user_data['force_sub_msg_id'])
                                 del context.user_data['force_sub_msg_id']
                             except Exception as e:
                                 log.error(f"Failed to delete force sub message: {e}")
+                                
+                        sending_msg = await context.bot.send_message(chat_id=user_id, text="⏳ Bot sending files...")
+                        
+                        # Send the file
+                        await send_shared_content(context, user_id, shared_content)
+                        log.info(f"✅ Auto-sent file {f_key} to user {user_id}")
+                        
+                        try:
+                            await sending_msg.delete()
+                        except Exception as e:
+                            log.warning(f"Could not delete sending message: {e}")
                         
                         # Update user interaction
                         await db.update_user_interaction(
