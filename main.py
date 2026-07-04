@@ -1535,7 +1535,7 @@ async def chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 continue
             
             # Check membership again fresh
-            membership_result = await check_membership(user_id, context, force_check=True)
+            membership_result = await check_membership(user_id, context, force_check=True, allow_private_requests=True)
             
             if membership_result['all_joined']:
                 log.info(f"🎯 User {user_id} now has ALL channels! Sending file: {file_key}")
@@ -1639,7 +1639,7 @@ async def chat_join_request_handler(update: Update, context: ContextTypes.DEFAUL
                 continue
             
             # Check membership again fresh
-            membership_result = await check_membership(user_id, context, force_check=True)
+            membership_result = await check_membership(user_id, context, force_check=True, allow_private_requests=True)
             
             if membership_result['all_joined']:
                 log.info(f"🎯 User {user_id} now has ALL channels (via request)! Sending file: {f_key}")
@@ -2631,7 +2631,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Check membership with force=True
         log.info(f"🔍 Checking membership for user {user_id}")
-        result = await check_membership(user_id, context, force_check=True)
+        result = await check_membership(user_id, context, force_check=True, allow_private_requests=True)
 
         log.info(f"📊 Membership result: all_joined={result['all_joined']}, missing={result['missing_channel_names']}")
 
@@ -2772,7 +2772,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result = await check_membership(
                 user_id,
                 context,
-                force_check=True
+                force_check=True,
+                allow_private_requests=True
             )
 
             if result['all_joined']:
