@@ -25,7 +25,7 @@ app = Flask(__name__)
 
 # Global variables for web dashboard
 start_time = time.time()
-bot_username = "movionfire_bot"
+bot_username = "xaiomovie_bot"
 # Global variable to store bot application instance for webhook
 bot_app = None
 bot_loop = None
@@ -100,6 +100,10 @@ from telegram.ext import (
     ChatMemberHandler
 )
 from telegram.request import HTTPXRequest
+from telegram.error import RetryAfter, TimedOut, NetworkError
+
+# Global semaphore to limit concurrent Telegram API calls (prevents flood errors)
+_telegram_semaphore = asyncio.Semaphore(10)
 
 # ================= CONFIG =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -182,26 +186,35 @@ class Database:
             dsn = f"dbname='{database}' user='{user}' password='{password}' host='{host}' port='{port}'"
             log.info(f"🔌 Creating connection pool to Render PostgreSQL at {host}:{port}/{database}")
 
-            try:
-                self.pool = psycopg2.pool.ThreadedConnectionPool(
-                    1, 20, dsn=dsn, connect_timeout=30,
-                    sslmode='require'
-                )
-                log.info("✅ Render PostgreSQL connection pool created (SSL enabled)")
-
-                conn = self.pool.getconn()
+            max_retries = 5
+            for attempt in range(1, max_retries + 1):
                 try:
-                    with conn.cursor() as cur:
-                        self._init_db(conn, cur)
-                finally:
-                    self.pool.putconn(conn)
+                    self.pool = psycopg2.pool.ThreadedConnectionPool(
+                        1, 50, dsn=dsn, connect_timeout=30,
+                        sslmode='require',
+                        keepalives=1,
+                        keepalives_idle=30,
+                        keepalives_interval=10,
+                        keepalives_count=5
+                    )
+                    log.info("✅ Render PostgreSQL connection pool created (SSL enabled)")
 
-                self._pool_initialized = True
-                log.info("✅ Database tables initialized/verified.")
+                    conn = self.pool.getconn()
+                    try:
+                        with conn.cursor() as cur:
+                            self._init_db(conn, cur)
+                    finally:
+                        self.pool.putconn(conn)
 
-            except Exception as e:
-                log.error(f"❌ Failed to create connection pool to Render PostgreSQL: {e}")
-                raise
+                    self._pool_initialized = True
+                    log.info("✅ Database tables initialized/verified.")
+                    break
+                except Exception as e:
+                    log.error(f"❌ Failed to create connection pool to Render PostgreSQL (Attempt {attempt}/{max_retries}): {e}")
+                    if attempt < max_retries:
+                        time.sleep(10)
+                    else:
+                        raise
         return self.pool
 
     async def _get_pool_async(self):
@@ -351,6 +364,45 @@ class Database:
             )
         ''')
         
+        # Bot settings table (for tracking auto-backup timestamps, etc.)
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Polls table
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS polls (
+                id SERIAL PRIMARY KEY,
+                question TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Poll Options table
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS poll_options (
+                id SERIAL PRIMARY KEY,
+                poll_id INTEGER NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+                option_text TEXT NOT NULL,
+                position INTEGER DEFAULT 0
+            )
+        ''')
+        
+        # Poll Votes table
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS poll_votes (
+                poll_id INTEGER NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL,
+                option_id INTEGER NOT NULL REFERENCES poll_options(id) ON DELETE CASCADE,
+                voted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (poll_id, user_id)
+            )
+        ''')
+        
         # Create indexes
         cur.execute('CREATE INDEX IF NOT EXISTS idx_files_timestamp ON files(timestamp)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_file_groups_timestamp ON file_groups(timestamp)')
@@ -363,6 +415,23 @@ class Database:
         cur.execute('CREATE INDEX IF NOT EXISTS idx_channels_active ON required_channels(is_active)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_private_requests_user ON private_channel_requests(user_id)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_pending_delivery_user ON pending_file_delivery(user_id)')
+        
+        # ---- Migrations for older databases ----
+        # Add missing columns to required_channels if they don't exist
+        for col_name, col_def in [
+            ('channel_type', "TEXT DEFAULT 'public'"),
+            ('invite_link', 'TEXT'),
+            ('position', 'INTEGER DEFAULT 0'),
+            ('added_by', 'BIGINT'),
+            ('added_at', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP'),
+        ]:
+            cur.execute('''
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'required_channels' AND column_name = %s
+            ''', (col_name,))
+            if not cur.fetchone():
+                cur.execute(f'ALTER TABLE required_channels ADD COLUMN {col_name} {col_def}')
+                log.info(f"Migration: added column '{col_name}' to required_channels")
         
         # Insert default channels if table is empty
         cur.execute("SELECT COUNT(*) FROM required_channels")
@@ -385,11 +454,23 @@ class Database:
     async def get_db_connection(self):
         """Asynchronous context manager to get and return a connection from the pool."""
         await self._get_pool_async()
-        conn = await asyncio.to_thread(self._get_valid_connection_sync)
+        
+        conn = None
+        for attempt in range(15):
+            try:
+                conn = await asyncio.to_thread(self._get_valid_connection_sync)
+                break
+            except pool.PoolError:
+                if attempt == 14:
+                    log.error("Database connection pool exhausted after multiple retries.")
+                    raise
+                await asyncio.sleep(0.5)
+                
         try:
             yield conn
         finally:
-            await asyncio.to_thread(self.pool.putconn, conn)
+            if conn is not None:
+                await asyncio.to_thread(self.pool.putconn, conn)
 
     async def execute(self, query: str, params: tuple = None):
         """Execute a query and return cursor"""
@@ -867,6 +948,23 @@ class Database:
         result = await self.fetchrow("SELECT COUNT(*) as count FROM files")
         return result['count'] if result else 0
 
+    async def get_setting(self, key: str) -> str:
+        """Get a bot setting value by key. Returns None if not found."""
+        result = await self.fetchrow(
+            "SELECT value FROM bot_settings WHERE key = %s", (key,)
+        )
+        return result['value'] if result else None
+
+    async def set_setting(self, key: str, value: str):
+        """Set a bot setting value (upsert)."""
+        await self.execute_and_commit('''
+            INSERT INTO bot_settings (key, value, updated_at)
+            VALUES (%s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (key) DO UPDATE
+            SET value = EXCLUDED.value,
+                updated_at = EXCLUDED.updated_at
+        ''', (key, value))
+
     async def cache_membership(self, user_id: int, channel: str, is_member: bool):
         """Cache membership check result."""
         await self.execute_and_commit('''
@@ -1232,25 +1330,50 @@ async def get_shared_content(key: str) -> Optional[dict]:
 
 
 async def send_file_record(context: ContextTypes.DEFAULT_TYPE, chat_id: int, file_info: dict, caption: str):
-    """Send one stored Telegram file as video when playable, otherwise document."""
+    """Send one stored Telegram file as video when playable, otherwise document.
+    
+    Includes retry logic for Telegram rate limits (RetryAfter), timeouts, and
+    network errors. Uses a global semaphore to limit concurrent API calls.
+    """
     filename = file_info.get('file_name', 'file')
     ext = filename.lower().split('.')[-1] if '.' in filename else ""
+    max_retries = 5
 
-    if file_info.get('is_video') and ext in PLAYABLE_EXTS:
-        return await context.bot.send_video(
-            chat_id=chat_id,
-            video=file_info["file_id"],
-            caption=caption,
-            parse_mode="Markdown",
-            supports_streaming=True
-        )
+    for attempt in range(max_retries):
+        try:
+            async with _telegram_semaphore:
+                if file_info.get('is_video') and ext in PLAYABLE_EXTS:
+                    return await context.bot.send_video(
+                        chat_id=chat_id,
+                        video=file_info["file_id"],
+                        caption=caption,
+                        parse_mode="Markdown",
+                        supports_streaming=True
+                    )
 
-    return await context.bot.send_document(
-        chat_id=chat_id,
-        document=file_info["file_id"],
-        caption=caption,
-        parse_mode="Markdown"
-    )
+                return await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=file_info["file_id"],
+                    caption=caption,
+                    parse_mode="Markdown"
+                )
+
+        except RetryAfter as e:
+            wait = e.retry_after + 1
+            log.warning(f"Rate limited sending file to {chat_id}. Waiting {wait}s (attempt {attempt+1}/{max_retries})")
+            await asyncio.sleep(wait)
+        except TimedOut:
+            wait = 2 * (attempt + 1)
+            log.warning(f"Timeout sending file to {chat_id}. Retrying in {wait}s (attempt {attempt+1}/{max_retries})")
+            await asyncio.sleep(wait)
+        except NetworkError as e:
+            if attempt == max_retries - 1:
+                raise
+            wait = 2 * (attempt + 1)
+            log.warning(f"Network error sending file to {chat_id}: {e}. Retrying in {wait}s (attempt {attempt+1}/{max_retries})")
+            await asyncio.sleep(wait)
+
+    raise RuntimeError(f"Failed to send file to {chat_id} after {max_retries} retries")
 
 
 async def send_shared_content(context: ContextTypes.DEFAULT_TYPE, chat_id: int, content: dict) -> List[Any]:
@@ -1276,7 +1399,7 @@ async def send_shared_content(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
             sent = await send_file_record(context, chat_id, file_info, caption)
             await schedule_message_deletion(context, sent.chat_id, sent.message_id)
             sent_messages.append(sent)
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.3)
 
         return sent_messages
 
@@ -1364,7 +1487,26 @@ async def check_user_in_channel(bot, channel: str, user_id: int, force_check: bo
             return False, "invalid channel identifier"
 
         log.info(f"🔍 Checking user {user_id} in channel {channel_ref}")
-        member = await bot.get_chat_member(chat_id=channel_ref, user_id=user_id)
+        
+        # Use semaphore + retry to handle rate limits under high concurrency
+        member = None
+        for attempt in range(4):
+            try:
+                async with _telegram_semaphore:
+                    member = await bot.get_chat_member(chat_id=channel_ref, user_id=user_id)
+                break
+            except RetryAfter as e:
+                wait = e.retry_after + 1
+                log.warning(f"Rate limited checking {user_id} in {clean_channel}. Waiting {wait}s (attempt {attempt+1}/4)")
+                await asyncio.sleep(wait)
+            except TimedOut:
+                if attempt == 3:
+                    raise
+                await asyncio.sleep(1 * (attempt + 1))
+        
+        if member is None:
+            return False, "rate limited after retries"
+        
         is_member = member.status in ["member", "administrator", "creator"]
         if not is_member and member.status == "restricted":
             is_member = bool(getattr(member, "is_member", False))
@@ -1393,9 +1535,15 @@ async def check_membership(
     user_id: int,
     context: ContextTypes.DEFAULT_TYPE,
     force_check: bool = False,
-    allow_private_requests: bool = False
+    allow_private_requests: bool = False,
+    prefetched_channels: list = None
 ) -> Dict[str, Any]:
-    """Check if user is member of all required channels"""
+    """Check if user is member of all required channels.
+    
+    Args:
+        prefetched_channels: Optional pre-fetched list from get_channels_with_details()
+                             to avoid a duplicate DB query.
+    """
     bot = context.bot
 
     result = {
@@ -1408,8 +1556,11 @@ async def check_membership(
         "verification_errors": []
     }
 
-    channels_data = await db.get_channels_with_details()
-    active_channels = [c for c in channels_data if c['is_active'] == 1]
+    if prefetched_channels is not None:
+        active_channels = [c for c in prefetched_channels if c['is_active'] == 1]
+    else:
+        channels_data = await db.get_channels_with_details()
+        active_channels = [c for c in channels_data if c['is_active'] == 1]
     
     log.info(f"📋 Found {len(active_channels)} active channels for user {user_id}")
     
@@ -1420,7 +1571,8 @@ async def check_membership(
     if force_check:
         await db.clear_membership_cache(user_id)
 
-    for channel_data in active_channels:
+    # --- Check ALL channels in parallel for speed ---
+    async def _check_one(channel_data):
         channel = channel_data['channel_username']
         channel_name = channel_data['channel_name'] or channel
         channel_id = channel_data['id']
@@ -1428,7 +1580,7 @@ async def check_membership(
         
         is_member, verification_error = await check_user_in_channel(bot, channel, user_id, force_check)
         
-        # ADD THIS: Check for private channel request
+        # Check for private channel request
         if allow_private_requests and not is_member and channel_type == 'private':
             has_request = await db.has_private_request(user_id, channel_id)
             if has_request:
@@ -1436,6 +1588,11 @@ async def check_membership(
                 is_member = True
                 verification_error = None
         
+        return channel, channel_name, channel_id, channel_type, is_member, verification_error
+
+    check_results = await asyncio.gather(*[_check_one(cd) for cd in active_channels])
+
+    for channel, channel_name, channel_id, channel_type, is_member, verification_error in check_results:
         result["channel_status"][channel] = {
             'is_member': is_member,
             'name': channel_name,
@@ -1963,7 +2120,7 @@ INTEGER_IMPORT_COLUMNS = {
     "id", "is_video", "access_count", "total_interactions",
     "total_files_accessed", "is_active", "position", "delete_after",
     "added_by", "message_id", "group_id", "file_db_id", "file_count",
-    "channel_id", "requested"
+    "channel_id"
 }
 
 BIGINT_IMPORT_COLUMNS = {"user_id", "chat_id", "file_size", "total_size"}
@@ -2026,6 +2183,16 @@ def convert_import_value(column: str, value: Any) -> Any:
     stripped = value.strip()
     if stripped == "" or stripped.upper() in {"NULL", "NONE"}:
         return None
+
+    if column == "requested":
+        return stripped.lower() in {"true", "1", "yes", "t", "y"}
+
+    if stripped.startswith("[") and stripped.endswith("]"):
+        import ast
+        try:
+            return ast.literal_eval(stripped)
+        except Exception:
+            pass
 
     if column in INTEGER_IMPORT_COLUMNS or column in BIGINT_IMPORT_COLUMNS:
         return int(stripped)
@@ -2270,7 +2437,9 @@ async def send_backup_to_admin(context: ContextTypes.DEFAULT_TYPE, backup_data: 
                     chat_id=ADMIN_ID,
                     document=file_bytes,
                     filename=send_filename,
-                    caption=f"{file_emoji} {filename} - {len(content.splitlines())} lines"
+                    caption=f"{file_emoji} {filename} - {len(content.splitlines())} lines",
+                    read_timeout=120,
+                    write_timeout=120
                 )
                 
                 await asyncio.sleep(0.5)
@@ -2600,7 +2769,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 if channel_type == 'private' and channel_data.get('invite_link'):
                     keyboard.append([InlineKeyboardButton(
-                        f"📢 Request to Join {channel_name}", 
+                        f"📢 Join {channel_name}", 
                         url=channel_data['invite_link']
                     )])
                 else:
@@ -2630,7 +2799,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key = args[0]
         log.info(f"🔑 User {user_id} accessing file key: {key}")
         
-        shared_content = await get_shared_content(key)
+        # Run file lookup and membership check concurrently for speed
+        log.info(f"🔍 Checking membership for user {user_id}")
+        shared_content_task = get_shared_content(key)
+        membership_task = check_membership(
+            user_id, context, force_check=True,
+            allow_private_requests=True, prefetched_channels=active_channels
+        )
+        shared_content, result = await asyncio.gather(shared_content_task, membership_task)
 
         if not shared_content:
             log.warning(f"❌ File key {key} not found for user {user_id}")
@@ -2642,10 +2818,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.info(f"File group found: {key} ({len(shared_content.get('files') or [])} files)")
         else:
             log.info(f"File found: {shared_content['file_name']}")
-
-        # Check membership with force=True
-        log.info(f"🔍 Checking membership for user {user_id}")
-        result = await check_membership(user_id, context, force_check=True, allow_private_requests=True)
 
         log.info(f"📊 Membership result: all_joined={result['all_joined']}, missing={result['missing_channel_names']}")
 
@@ -2694,23 +2866,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )])
             
             # Create appropriate message
-            safe_missing_names = [escape_markdown(name) for name in missing_names]
-            has_private_missing = any(t == 'private' for t in missing_types)
-            has_public_missing = any(t != 'private' for t in missing_types)
-            action_text = "Join" if has_private_missing and has_public_missing else (
-                "Join" if has_private_missing else "Join"
-            )
-            if len(safe_missing_names) == 1:
-                text = f"🔒 {action_text} {safe_missing_names[0]} to get this file"
-            elif len(safe_missing_names) == 2:
-                text = f"🔒 {action_text} {safe_missing_names[0]} and {safe_missing_names[1]} to get this file"
-            else:
-                channels_text = ", ".join(safe_missing_names[:-1]) + f" and {safe_missing_names[-1]}"
-                text = f"🔒 {action_text} {channels_text} to get this file"
-
-            if verification_errors:
-                unresolved = ", ".join(markdown_code(item["name"]) for item in verification_errors)
-                text += f"\n\n File will be provided by Bot."
+            text = "Join all the channels\nBot will send file"
 
             log.info(f"📨 Sending restriction message to user {user_id} with {len(keyboard)} buttons")
             
@@ -2743,7 +2899,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Clean up any pending deliveries
             await db.remove_pending_delivery(user_id, key)
-            await db.clear_user_requests(user_id)
 
         except Exception as e:
             log.error(f"❌ Error sending file to user {user_id}: {e}", exc_info=True)
@@ -2752,6 +2907,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         log.error(f"❌ Start error: {e}", exc_info=True)
+        try:
+            if update.message:
+                await update.message.reply_text(f"❌ Start error: {e}")
+        except Exception:
+            pass
 
 # ============ CALLBACK HANDLER ============
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2803,7 +2963,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     
                     # Clean up
                     await db.remove_pending_delivery(user_id, key)
-                    await db.clear_user_requests(user_id)
                     
                 except Exception as e:
                     log.error(f"❌ Failed to send file to user {user_id}: {e}", exc_info=True)
@@ -2884,7 +3043,7 @@ async def addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await schedule_message_deletion(context, sent_msg.chat_id, sent_msg.message_id)
                         return
                     
-                    # Create invite link
+                    # Create invite link (no expiry)
                     invite_link = await context.bot.create_chat_invite_link(
                         chat_id=channel_ref,
                         creates_join_request=True
@@ -3171,16 +3330,33 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     waiting_count = 0
     approve_chat_id = int(channel_id) if channel_id.lstrip('-').isdigit() else channel_id
     
-    for request in pending_requests:
+    # Pre-fetch channels ONCE to avoid repeated DB queries per user
+    all_channels_data = await db.get_channels_with_details()
+    
+    for idx, request in enumerate(pending_requests):
         user_id = request['user_id']
         file_key = request['file_key']
         
         try:
+            # Approve the Telegram join request with retry for rate limits
             try:
-                await context.bot.approve_chat_join_request(
-                    chat_id=approve_chat_id,
-                    user_id=int(user_id)
-                )
+                for attempt in range(4):
+                    try:
+                        async with _telegram_semaphore:
+                            await context.bot.approve_chat_join_request(
+                                chat_id=approve_chat_id,
+                                user_id=int(user_id)
+                            )
+                        break
+                    except RetryAfter as e:
+                        wait = e.retry_after + 1
+                        log.warning(f"Rate limited approving user {user_id}. Waiting {wait}s")
+                        await asyncio.sleep(wait)
+                    except TimedOut:
+                        if attempt == 3:
+                            raise
+                        await asyncio.sleep(1 * (attempt + 1))
+                
                 join_approved_count += 1
                 log.info(f"Approved Telegram join request for user {user_id} in {channel_name}")
             except Exception as approve_error:
@@ -3214,12 +3390,13 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await db.clear_user_requests(user_id, db_channel_id)
                     continue
 
-            # Check if user is now a member
+            # Check if user is now a member (reuse prefetched channels)
             result = await check_membership(
                 user_id,
                 context,
                 force_check=True,
-                allow_private_requests=True
+                allow_private_requests=True,
+                prefetched_channels=all_channels_data
             )
             
             if result['all_joined']:
@@ -3269,6 +3446,20 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.error(f"❌ Error processing user {user_id}: {e}")
             failed_count += 1
+        
+        # Delay between users to avoid Telegram flood errors
+        await asyncio.sleep(0.5)
+        
+        # Update progress every 10 users
+        processed = idx + 1
+        if processed % 10 == 0 and processed < len(pending_requests):
+            try:
+                await status_msg.edit_text(
+                    f"🔄 Processing {channel_name}... {processed}/{len(pending_requests)}\n"
+                    f"✅ Sent: {approved_count} | ⏳ Waiting: {waiting_count} | ❌ Failed: {failed_count}"
+                )
+            except Exception:
+                pass
     
     # Send completion message
     sent_msg = await update.message.reply_text(
@@ -4097,6 +4288,277 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             log.error(f"Error in broadcast confirmation: {e}")
             await query.message.reply_text(f"❌ Error starting broadcast: {str(e)[:100]}")
 
+# ============ POLL FEATURE ============
+
+async def poll_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Create a custom poll with inline buttons and broadcast to all users."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+        
+    import shlex
+    text = get_command_body(update.message.text or update.message.caption or "", "poll")
+    if not text:
+        await update.message.reply_text("❌ Usage: `/poll \"Your question?\" \"Option 1\" \"Option 2\" ...`\n\nExample: `/poll \"Favorite Color?\" \"Red\" \"Blue\"`", parse_mode="Markdown")
+        return
+
+    try:
+        args = shlex.split(text)
+    except Exception as e:
+        await update.message.reply_text("❌ Error parsing arguments. Make sure you match your quotes correctly.")
+        return
+
+    if len(args) < 3:
+        await update.message.reply_text("❌ A poll needs at least a question and two options.")
+        return
+
+    question = args[0]
+    options = args[1:]
+    
+    if len(question) > 1024:
+        await update.message.reply_text("❌ Question is too long.")
+        return
+        
+    for opt in options:
+        if len(opt) > 100:
+            await update.message.reply_text(f"❌ Option '{opt}' is too long (max 100 chars).")
+            return
+
+    # Insert poll into database
+    async with db.get_db_connection() as conn:
+        def _insert():
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute("INSERT INTO polls (question) VALUES (%s) RETURNING id", (question,))
+                poll_id = cur.fetchone()['id']
+                
+                for i, opt in enumerate(options):
+                    cur.execute("INSERT INTO poll_options (poll_id, option_text, position) VALUES (%s, %s, %s)", (poll_id, opt, i))
+            conn.commit()
+            return poll_id
+        poll_id = await asyncio.to_thread(_insert)
+
+    # Generate the inline keyboard for the preview
+    # Admin preview will show counts (which are 0 right now)
+    buttons = []
+    for i, opt in enumerate(options):
+        buttons.append([InlineKeyboardButton(f"{opt} (0)", callback_data=f"poll_preview|{poll_id}")])
+    
+    confirm_data = f"confirm_poll|{poll_id}"
+    cancel_data = f"cancel_poll|{poll_id}"
+    
+    action_row = [
+        InlineKeyboardButton("✅ Confirm Broadcast", callback_data=confirm_data),
+        InlineKeyboardButton("❌ Cancel", callback_data=cancel_data)
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(buttons + [action_row])
+    
+    await update.message.reply_text(
+        f"📊 *Poll Preview*\n\n{escape_markdown(question)}",
+        parse_mode="MarkdownV2",
+        reply_markup=reply_markup
+    )
+
+async def build_poll_keyboard(poll_id: int, user_id: int = None, show_counts: bool = False) -> InlineKeyboardMarkup:
+    """Build the inline keyboard for a poll based on current DB state."""
+    options = await db.fetchall("SELECT id, option_text FROM poll_options WHERE poll_id = %s ORDER BY position", (poll_id,))
+    
+    user_vote_id = None
+    if user_id:
+        vote_row = await db.fetchrow("SELECT option_id FROM poll_votes WHERE poll_id = %s AND user_id = %s", (poll_id, user_id))
+        if vote_row:
+            user_vote_id = vote_row['option_id']
+            
+    keyboard = []
+    for opt in options:
+        opt_id = opt['id']
+        text = opt['option_text']
+        
+        if show_counts:
+            res = await db.fetchrow("SELECT COUNT(*) as c FROM poll_votes WHERE option_id = %s", (opt_id,))
+            count = res['c'] if res else 0
+            text += f" ({count})"
+            
+        if user_vote_id == opt_id:
+            text = f"✅ {text}"
+            
+        keyboard.append([InlineKeyboardButton(text, callback_data=f"poll_vote|{poll_id}|{opt_id}")])
+        
+    return InlineKeyboardMarkup(keyboard)
+
+async def poll_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle poll confirmation/cancellation"""
+    query = update.callback_query
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("You are not the admin.", show_alert=True)
+        return
+        
+    data = query.data
+    action, _, poll_id = data.partition("|")
+    poll_id = int(poll_id)
+    
+    if action == "cancel_poll":
+        await query.message.edit_text("❌ Poll broadcast cancelled.")
+        await query.answer()
+        return
+        
+    if action == "confirm_poll":
+        try:
+            question_row = await db.fetchrow("SELECT question FROM polls WHERE id = %s", (poll_id,))
+            if not question_row:
+                await query.message.edit_text("❌ Poll not found in DB.")
+                await query.answer()
+                return
+                
+            question = question_row['question']
+            user_ids = await db.get_all_user_ids(exclude_admin=True)
+            total_users = len(user_ids)
+            
+            if total_users == 0:
+                await query.message.reply_text("❌ No users found to broadcast")
+                await query.answer()
+                return
+                
+            status_msg = await query.message.reply_text(
+                f"🔄 Starting poll broadcast to {total_users} users...\n"
+                f"📦 Processing in chunks of {BROADCAST_CHUNK_SIZE} users"
+            )
+            
+            payload = {
+                "type": "poll",
+                "question": question,
+                "poll_id": poll_id
+            }
+            
+            asyncio.create_task(process_poll_broadcast_chunks(context, user_ids, payload, status_msg))
+            
+            kb = await build_poll_keyboard(poll_id, show_counts=True)
+            await query.message.edit_reply_markup(reply_markup=kb)
+            await query.answer("Broadcast started!")
+            
+        except Exception as e:
+            log.error(f"Error starting poll broadcast: {e}")
+            await query.message.reply_text(f"❌ Error starting broadcast: {str(e)[:100]}")
+            await query.answer()
+
+async def process_poll_broadcast_chunks(context, user_ids, payload, status_msg):
+    total_users = len(user_ids)
+    total_chunks = (total_users + BROADCAST_CHUNK_SIZE - 1) // BROADCAST_CHUNK_SIZE
+    successful, failed = 0, 0
+    poll_id = payload["poll_id"]
+    question_text = f"📊 *Poll*\n\n{escape_markdown(payload['question'])}"
+    
+    reply_markup = await build_poll_keyboard(poll_id, show_counts=False)
+    
+    for chunk_num in range(total_chunks):
+        chunk_start = chunk_num * BROADCAST_CHUNK_SIZE
+        chunk_end = min((chunk_num + 1) * BROADCAST_CHUNK_SIZE, total_users)
+        chunk = user_ids[chunk_start:chunk_end]
+        
+        for user_id in chunk:
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=question_text,
+                    parse_mode="MarkdownV2",
+                    reply_markup=reply_markup
+                )
+                successful += 1
+            except Exception:
+                failed += 1
+                
+        if chunk_num % 2 == 0 or chunk_num == total_chunks - 1:
+            try:
+                prog_text = (
+                    f"🔄 Broadcasting Poll...\n"
+                    f"📦 Progress: {chunk_end}/{total_users}\n"
+                    f"✅ Success: {successful} | ❌ Failed: {failed}"
+                )
+                await status_msg.edit_text(prog_text)
+            except:
+                pass
+                
+        await asyncio.sleep(0.5)
+        
+    try:
+        await status_msg.reply_text(f"✅ *Poll Broadcast Complete!*\nSuccess: {successful}\nFailed: {failed}", parse_mode="Markdown")
+    except:
+        pass
+
+async def handle_poll_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    user_id = query.from_user.id
+    
+    if data.startswith("poll_preview|"):
+        await query.answer("This is just a preview.")
+        return
+        
+    _, poll_id, option_id = data.split("|")
+    poll_id = int(poll_id)
+    option_id = int(option_id)
+    
+    try:
+        await db.execute_and_commit(
+            "INSERT INTO poll_votes (poll_id, user_id, option_id) VALUES (%s, %s, %s) ON CONFLICT (poll_id, user_id) DO UPDATE SET option_id = EXCLUDED.option_id, voted_at = CURRENT_TIMESTAMP",
+            (poll_id, user_id, option_id)
+        )
+        
+        await query.answer("Vote recorded!")
+        
+        # Determine if we should show counts (only if it's the admin clicking their own preview)
+        # Actually, let's just always hide counts on the broadcasted message, and add a checkmark for the user.
+        # But if the admin taps the preview message, they should probably see counts.
+        # We can figure out if it's the preview message by checking if user_id == ADMIN_ID.
+        # Let's just do user_id=ADMIN_ID gets counts to keep it simple.
+        show_counts = (user_id == ADMIN_ID)
+        kb = await build_poll_keyboard(poll_id, user_id=user_id, show_counts=show_counts)
+        try:
+            await query.message.edit_reply_markup(reply_markup=kb)
+        except Exception:
+            pass
+            
+    except Exception as e:
+        log.error(f"Error handling vote: {e}")
+        await query.answer("Error recording vote. Please try again.")
+
+async def poll_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to view poll stats"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+        
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /poll_stats <poll_id>")
+        return
+        
+    try:
+        poll_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("Poll ID must be a number.")
+        return
+        
+    poll_row = await db.fetchrow("SELECT question FROM polls WHERE id = %s", (poll_id,))
+    if not poll_row:
+        await update.message.reply_text("Poll not found.")
+        return
+        
+    question = poll_row['question']
+    options = await db.fetchall(
+        "SELECT o.option_text, COUNT(v.user_id) as count FROM poll_options o LEFT JOIN poll_votes v ON o.id = v.option_id WHERE o.poll_id = %s GROUP BY o.id ORDER BY o.position",
+        (poll_id,)
+    )
+    
+    text = f"📊 *Stats for Poll {poll_id}*\n\nQuestion: {escape_markdown(question)}\n\n"
+    total_votes = 0
+    for opt in options:
+        c = opt['count']
+        total_votes += c
+        text += f"• {escape_markdown(opt['option_text'])}: {c} votes\n"
+        
+    text += f"\n*Total Votes: {total_votes}*"
+    await update.message.reply_text(text, parse_mode="MarkdownV2")
+
+
 async def clearcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Clear membership cache (admin only)"""
     if update.effective_user.id != ADMIN_ID:
@@ -4526,12 +4988,29 @@ async def import_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"❌ Import failed: {str(e)[:200]}")
 
 async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
-    """Automated backup job - runs every 3 days"""
+    """Automated backup job - runs every 3 days (skips if last backup was recent)"""
+    BACKUP_INTERVAL_SECONDS = 259200  # 3 days
+    
+    # Check last backup time from database to avoid too-frequent backups on restarts
+    try:
+        last_backup = await db.get_setting('last_auto_backup')
+        if last_backup:
+            last_backup_time = datetime.fromisoformat(last_backup)
+            elapsed = (datetime.now() - last_backup_time).total_seconds()
+            if elapsed < BACKUP_INTERVAL_SECONDS:
+                remaining_hours = (BACKUP_INTERVAL_SECONDS - elapsed) / 3600
+                log.info(f"⏭️ Skipping auto-backup: last backup was {elapsed/3600:.1f}h ago, next in {remaining_hours:.1f}h")
+                return
+    except Exception as e:
+        log.warning(f"Could not check last backup time: {e}")
+    
     log.info("🔄 Running scheduled auto-backup (every 3 days)...")
     
     try:
         backup_data = await export_database_backup(update=None, context=context, send_to_admin=True)
         log.info(f"✅ Auto-backup completed. Size: {sum(len(v) for v in backup_data.values()) / 1024:.2f} KB")
+        # Record successful backup time in database
+        await db.set_setting('last_auto_backup', datetime.now().isoformat())
     except Exception as e:
         log.error(f"❌ Auto-backup failed: {e}")
         try:
@@ -4572,29 +5051,48 @@ async def keepalive_loop(bot):
 
 async def auto_backup_loop(bot):
     """Fallback auto-backup loop for deployments without python-telegram-bot JobQueue."""
-    await asyncio.sleep(3600)
+    BACKUP_INTERVAL_SECONDS = 259200  # 3 days
+    CHECK_INTERVAL_SECONDS = 3600     # Check every hour
+    await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
     while True:
-        log.info("Running fallback scheduled auto-backup (every 3 days)...")
-
+        # Check last backup time from database to avoid too-frequent backups on restarts
+        should_backup = True
         try:
-            backup_data = await export_database_backup(
-                update=None,
-                context=BotOnlyContext(bot),
-                send_to_admin=True
-            )
-            log.info(f"Fallback auto-backup completed. Size: {sum(len(v) for v in backup_data.values()) / 1024:.2f} KB")
+            last_backup = await db.get_setting('last_auto_backup')
+            if last_backup:
+                last_backup_time = datetime.fromisoformat(last_backup)
+                elapsed = (datetime.now() - last_backup_time).total_seconds()
+                if elapsed < BACKUP_INTERVAL_SECONDS:
+                    remaining_hours = (BACKUP_INTERVAL_SECONDS - elapsed) / 3600
+                    log.info(f"⏭️ Skipping fallback auto-backup: last backup was {elapsed/3600:.1f}h ago, next in {remaining_hours:.1f}h")
+                    should_backup = False
         except Exception as e:
-            log.error(f"Fallback auto-backup failed: {e}")
-            try:
-                await bot.send_message(
-                    chat_id=ADMIN_ID,
-                    text=f"Auto-backup failed: {str(e)[:200]}\n\nPlease run manual backup with /backup"
-                )
-            except Exception:
-                pass
+            log.warning(f"Could not check last backup time in fallback loop: {e}")
 
-        await asyncio.sleep(259200)
+        if should_backup:
+            log.info("Running fallback scheduled auto-backup (every 3 days)...")
+
+            try:
+                backup_data = await export_database_backup(
+                    update=None,
+                    context=BotOnlyContext(bot),
+                    send_to_admin=True
+                )
+                log.info(f"Fallback auto-backup completed. Size: {sum(len(v) for v in backup_data.values()) / 1024:.2f} KB")
+                # Record successful backup time in database
+                await db.set_setting('last_auto_backup', datetime.now().isoformat())
+            except Exception as e:
+                log.error(f"Fallback auto-backup failed: {e}")
+                try:
+                    await bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text=f"Auto-backup failed: {str(e)[:200]}\n\nPlease run manual backup with /backup"
+                    )
+                except Exception:
+                    pass
+
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 # ============ MAIN ============
 async def initialize_bot():
@@ -4613,7 +5111,12 @@ async def initialize_bot():
         log.error(f"Failed to initialize database: {e}", exc_info=True)
         return None
 
-    request = HTTPXRequest(connection_pool_size=40)
+    request = HTTPXRequest(
+        connection_pool_size=40,
+        read_timeout=60,
+        write_timeout=60,
+        connect_timeout=30
+    )
     application = Application.builder().token(BOT_TOKEN).request(request).build()
     
     await application.initialize()
@@ -4665,6 +5168,8 @@ async def initialize_bot():
     application.add_handler(CommandHandler("deletefile", deletefile))
     application.add_handler(CommandHandler("users", users))
     application.add_handler(CommandHandler("broadcast", broadcast))
+    application.add_handler(CommandHandler("poll", poll_cmd))
+    application.add_handler(CommandHandler("poll_stats", poll_stats_cmd))
     application.add_handler(CommandHandler("clearcache", clearcache))
     
     # Channel management commands
@@ -4683,6 +5188,8 @@ async def initialize_bot():
     # Add callback handlers
     application.add_handler(CallbackQueryHandler(callback_handler, pattern="^(status\\|)|^(noop)$"))
     application.add_handler(CallbackQueryHandler(broadcast_callback, pattern="^(confirm_broadcast|cancel_broadcast)(\\|.+)?$"))
+    application.add_handler(CallbackQueryHandler(poll_action_callback, pattern="^(confirm_poll|cancel_poll)\\|"))
+    application.add_handler(CallbackQueryHandler(handle_poll_vote, pattern="^(poll_vote|poll_preview)\\|"))
     application.add_handler(CallbackQueryHandler(import_callback, pattern="^(confirm_import|cancel_import)$"))
 
     # Add upload handler (admin only)
@@ -4710,12 +5217,12 @@ async def initialize_bot():
     log.info(f"Setting webhook to: {webhook_url}")
 
     try:
-        await application.bot.delete_webhook(drop_pending_updates=False)
+        await application.bot.delete_webhook(drop_pending_updates=True)
         await application.bot.set_webhook(
             url=webhook_url,
             allowed_updates=Update.ALL_TYPES,
             max_connections=40,
-            drop_pending_updates=False
+            drop_pending_updates=True
         )
         log.info("✅ Webhook set successfully")
     except Exception as e:
