@@ -25,7 +25,7 @@ app = Flask(__name__)
 
 # Global variables for web dashboard
 start_time = time.time()
-bot_username = "xaiomovie_bot"
+bot_username = "movionfire_bot"
 # Global variable to store bot application instance for webhook
 bot_app = None
 bot_loop = None
@@ -611,7 +611,7 @@ class Database:
                 ON CONFLICT (channel_username) DO UPDATE
                 SET is_active = 1,
                     channel_type = COALESCE(EXCLUDED.channel_type, required_channels.channel_type),
-                    invite_link = COALESCE(EXCLUDED.invite_link, required_channels.invite_link),
+                    invite_link = EXCLUDED.invite_link,
                     added_by = EXCLUDED.added_by,
                     channel_name = COALESCE(EXCLUDED.channel_name, required_channels.channel_name)
             ''', (clean_username, friendly_name, channel_type, invite_link, added_by, next_pos))
@@ -623,17 +623,29 @@ class Database:
             return False
     
     async def remove_channel(self, channel_username: str) -> bool:
-        """Remove a required channel (soft delete by setting inactive)"""
+        """Remove a required channel (soft delete by setting inactive, clear invite link)"""
         clean_username = normalize_channel_username(channel_username)
         
+        # Get the channel id before deactivating (needed for cleaning up requests)
+        channel_row = await self.fetchrow(
+            "SELECT id, invite_link FROM required_channels WHERE channel_username = %s",
+            (clean_username,)
+        )
+        
         rowcount = await self.execute_and_commit('''
-            UPDATE required_channels SET is_active = 0
+            UPDATE required_channels SET is_active = 0, invite_link = NULL
             WHERE channel_username = %s
         ''', (clean_username,))
         
         if rowcount > 0:
             log.info(f"Channel removed: @{clean_username}")
             await self.execute_and_commit("DELETE FROM membership_cache WHERE channel = %s", (clean_username,))
+            # Clean up pending private channel requests for this channel
+            if channel_row:
+                await self.execute_and_commit(
+                    "DELETE FROM private_channel_requests WHERE channel_id = %s",
+                    (channel_row['id'],)
+                )
             return True
         return False
     
@@ -3453,9 +3465,33 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.warning(f"Could not delete status message: {e}")
 
 async def removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove a required channel (admin only)"""
+    """Remove a required channel (admin only) - revokes old invite links for private channels"""
     if update.effective_user.id != ADMIN_ID:
         return
+
+    async def _revoke_old_invite_link(channel_username: str):
+        """Revoke the stored invite link for a private channel before removing it."""
+        clean = normalize_channel_username(channel_username)
+        if not clean:
+            return
+        try:
+            row = await db.fetchrow(
+                "SELECT channel_type, invite_link, channel_username FROM required_channels WHERE channel_username = %s AND is_active = 1",
+                (clean,)
+            )
+            if row and row['channel_type'] == 'private' and row['invite_link']:
+                # Determine the Telegram chat reference
+                ch_ref = int(row['channel_username']) if str(row['channel_username']).lstrip('-').isdigit() else row['channel_username']
+                try:
+                    await context.bot.revoke_chat_invite_link(
+                        chat_id=ch_ref,
+                        invite_link=row['invite_link']
+                    )
+                    log.info(f"🔗 Revoked old invite link for private channel {clean}")
+                except Exception as e:
+                    log.warning(f"Could not revoke invite link for {clean}: {e}")
+        except Exception as e:
+            log.warning(f"Error looking up channel for invite revocation: {e}")
 
     if not context.args:
         # Check if replying to a forwarded message
@@ -3465,6 +3501,11 @@ async def removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if chat:
                 channel_id = str(chat.id)
                 chat_username = chat.username or channel_id
+                
+                # Revoke old invite link before removing
+                await _revoke_old_invite_link(chat_username)
+                if chat_username != channel_id:
+                    await _revoke_old_invite_link(channel_id)
                 
                 success = await db.remove_channel(chat_username)
                 if not success and chat_username != channel_id:
@@ -3496,6 +3537,9 @@ async def removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     channel = normalize_channel_username(context.args[0])
+    
+    # Revoke old invite link before removing
+    await _revoke_old_invite_link(channel)
     
     success = await db.remove_channel(channel)
     
